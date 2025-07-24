@@ -2,6 +2,7 @@
 -- PostgreSQL initialization script for n8n
 
 -- Create non-root user for n8n application
+-- Note: Password will be set via environment variable POSTGRES_NON_ROOT_PASSWORD
 DO
 $do$
 BEGIN
@@ -9,7 +10,7 @@ BEGIN
       SELECT FROM pg_catalog.pg_roles
       WHERE  rolname = 'n8n_user') THEN
       
-      CREATE ROLE n8n_user LOGIN PASSWORD 'your_secure_n8n_password_here';
+      CREATE ROLE n8n_user LOGIN PASSWORD 'SecureN8nPass123!';
    END IF;
 END
 $do$;
