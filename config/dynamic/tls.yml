@@ -1,0 +1,11 @@
+tls:
+  certificates:
+    - certFile: /etc/traefik/dynamic/localhost.crt
+      keyFile: /etc/traefik/dynamic/localhost.key
+      stores:
+        - default
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /etc/traefik/dynamic/localhost.crt
+        keyFile: /etc/traefik/dynamic/localhost.key

@@ -1,0 +1,72 @@
+# Environment variables and secrets
+.env
+.env.local
+.env.production
+.env.staging
+*.env
+
+# Backup files - contain sensitive data
+backups/
+*.sql
+*.tar.gz
+backup_info_*.txt
+
+# Local files directory - may contain sensitive workflow data
+local-files/
+
+# Docker volumes backup
+n8n_data_*.tar.gz
+postgres_*.sql
+local_files_*.tar.gz
+
+# SSL certificates and keys
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Configuration backups that may contain secrets
+docker-compose_*.yml
+env_*.txt
+
+# Logs that may contain sensitive information
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Node.js (if any local development)
+node_modules/
+npm-debug.log*
+
+# Database files
+*.sqlite
+*.db
+
+# Any credential or API key files
+credentials/
+secrets/
+keys/
+*.json.key
+*-credentials.json
+service-account*.json
+
+# Traefik dynamic configuration (may contain certificates)
+config/dynamic/
+
+# Any custom scripts that might contain passwords
+*password*
+*secret*
+*credential*

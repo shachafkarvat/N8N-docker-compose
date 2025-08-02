@@ -1,0 +1,133 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: n8n-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - n8n-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n
+    restart: always
+    ports:
+      - "127.0.0.1:5678:5678"
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.n8n.rule=Host(`${SUBDOMAIN}.${DOMAIN_NAME}`)
+      - traefik.http.routers.n8n.tls=true
+      - traefik.http.routers.n8n.entrypoints=web,websecure
+      - traefik.http.routers.n8n.tls.certresolver=mytlschallenge
+      - traefik.http.middlewares.n8n.headers.SSLRedirect=true
+      - traefik.http.middlewares.n8n.headers.STSSeconds=315360000
+      - traefik.http.middlewares.n8n.headers.browserXSSFilter=true
+      - traefik.http.middlewares.n8n.headers.contentTypeNosniff=true
+      - traefik.http.middlewares.n8n.headers.forceSTSHeader=true
+      - traefik.http.middlewares.n8n.headers.SSLHost=${DOMAIN_NAME}
+      - traefik.http.middlewares.n8n.headers.STSIncludeSubdomains=true
+      - traefik.http.middlewares.n8n.headers.STSPreload=true
+      - traefik.http.routers.n8n.middlewares=n8n@docker
+    environment:
+      - N8N_HOST=${SUBDOMAIN}.${DOMAIN_NAME}
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=https
+      - NODE_ENV=production
+      - WEBHOOK_URL=https://${SUBDOMAIN}.${DOMAIN_NAME}/
+      - GENERIC_TIMEZONE=${GENERIC_TIMEZONE}
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./local-files:/files
+
+  # n8n:
+  #   image: n8nio/n8n:1.44.0
+  #   container_name: n8n-app
+  #   restart: unless-stopped
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   environment:
+  #     # Database Configuration
+  #     - DB_TYPE=postgresdb
+  #     - DB_POSTGRESDB_HOST=postgres
+  #     - DB_POSTGRESDB_PORT=5432
+  #     - DB_POSTGRESDB_DATABASE=${POSTGRES_DB}
+  #     - DB_POSTGRESDB_USER=${POSTGRES_USER}
+  #     - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+      
+  #     # n8n Configuration
+  #     - N8N_HOST=${N8N_HOST}
+  #     - N8N_PORT=5678
+  #     - N8N_PROTOCOL=https
+  #     - WEBHOOK_URL=https://${N8N_HOST}
+  #     - VUE_APP_URL_BASE_API=https://${N8N_HOST}
+  #     - GENERIC_TIMEZONE=${TIMEZONE}
+  #     - N8N_RUNNERS_ENABLED=true
+      
+  #     # Security
+  #     - N8N_BASIC_AUTH_ACTIVE=true
+  #     - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
+  #     - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
+      
+  #     # Execution
+  #     - EXECUTIONS_MODE=regular
+  #     - EXECUTIONS_DATA_SAVE_ON_ERROR=all
+  #     - EXECUTIONS_DATA_SAVE_ON_SUCCESS=all
+  #     - EXECUTIONS_DATA_MAX_AGE=336  # 14 days
+      
+  #     # Workflow settings
+  #     - N8N_METRICS=true
+  #     - N8N_LOG_LEVEL=info
+  #     - N8N_LOG_OUTPUT=console
+  #   volumes:
+  #     - n8n_data:/home/node/.n8n
+  #   networks:
+  #     - n8n-network
+  #   ports:
+  #     - "5678:5678"
+  #   labels:
+  #     - "traefik.enable=true"
+  #     - "traefik.http.routers.n8n.rule=Host(`${N8N_HOST}`)"
+  #     - "traefik.http.services.n8n.loadbalancer.server.port=5678"
+
+  traefik:
+    image: "traefik"
+    restart: always
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.mytlschallenge.acme.tlschallenge=true"
+      - "--certificatesresolvers.mytlschallenge.acme.email=${SSL_EMAIL}"
+      - "--certificatesresolvers.mytlschallenge.acme.storage=/letsencrypt/acme.json"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - traefik_data:/letsencrypt
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+volumes:
+  postgres_data:
+    driver: local
+  n8n_data:
+    driver: local
+  traefik_data:
+    driver: local
+
+networks:
+  n8n-network:
+    driver: bridge

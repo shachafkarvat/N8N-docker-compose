@@ -55,11 +55,17 @@ fi
 
 # Pull latest images
 echo "⬇️ Pulling latest Docker images..."
-docker compose pull
+if ! docker compose pull; then
+    echo "❌ Failed to pull images. Continuing with existing images..."
+fi
 
 # Deploy stack
 echo "🏗️ Starting services..."
-docker compose up -d
+if ! docker compose up -d; then
+    echo "❌ Failed to start services. Checking for issues..."
+    docker compose logs --tail=20
+    exit 1
+fi
 
 # Wait for services to be healthy
 echo "⏳ Waiting for services to start..."
@@ -71,11 +77,24 @@ docker compose ps
 
 # Verify connectivity
 echo "🌐 Verifying connectivity..."
-if curl -k -s https://localhost/healthz > /dev/null 2>&1; then
-    echo "✅ n8n is accessible"
-else
-    echo "⚠️ n8n may still be starting up. Check logs: docker compose logs n8n"
-fi
+for i in {1..10}; do
+    if curl -k -s -f https://n8n.localhost > /dev/null 2>&1; then
+        echo "✅ n8n is accessible at https://n8n.localhost"
+        break
+    elif curl -k -s -f https://localhost > /dev/null 2>&1; then
+        echo "✅ n8n is accessible at https://localhost"
+        break
+    else
+        echo "⏳ Attempt $i/10: n8n not ready yet..."
+        sleep 10
+    fi
+    
+    if [[ $i -eq 10 ]]; then
+        echo "⚠️ n8n may still be starting up. Check logs:"
+        echo "   docker compose logs n8n"
+        echo "   docker compose logs traefik"
+    fi
+done
 
 echo ""
 echo "🎉 Deployment complete!"
