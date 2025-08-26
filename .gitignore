@@ -94,3 +94,10 @@ local-files/*.json
 local-files/config.json
 local-files/creds.json
 local-files/file.json
+
+# Database initialization scripts with hardcoded credentials
+init.sql
+
+# Additional backup files in root directory
+backup_*.sql
+*_backup.sql
