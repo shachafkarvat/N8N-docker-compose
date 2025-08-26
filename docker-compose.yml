@@ -71,7 +71,7 @@ services:
       - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD:-n8n}
       - N8N_RUNNERS_ENABLED=${N8N_RUNNERS_ENABLED:-true}
     volumes:
-      - ./Volumes/n8n_data:/home/node/.n8n
+      - n8n_data:/home/node/.n8n
       - ./local-files:/files
     depends_on:
       postgres:
@@ -100,5 +100,6 @@ services:
     # Always run backup service when stack is up
 
 volumes:
+  n8n_data:
   traefik_data:
   postgres_data:
