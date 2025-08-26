@@ -1,26 +1,35 @@
-# n8n Self-Hosted Docker Setup with Database Integration
+# n8n Self-Hosted Docker Setup with Automated Backup
 
-A complete, production-ready Docker Compose setup for n8n workflow automation on Ubuntu 25.04 with NVIDIA RTX 2070 GPU support, PostgreSQL database, and SSL termination.
+A production-ready Docker Compose setup for n8n workflow automation with PostgreSQL database, Traefik reverse proxy, SSL termination, and automated daily backups.
+
+## Architecture Overview
+
+This stack includes:
+- **n8n**: Workflow automation platform
+- **PostgreSQL**: Database for n8n data storage
+- **Traefik**: Reverse proxy with automatic SSL certificate management
+- **Backup Service**: Automated daily backups with retention management
 
 ## Prerequisites
 
 ### System Requirements
-- **OS**: Ubuntu 25.04 LTS (AMD64)
-- **Hardware**: NVIDIA RTX 2070 GPU or better
-- **Resources**: 8GB+ RAM, 30GB+ free disk space
-- **Network**: Internet connectivity for initial setup
-- **Privileges**: Sudo access for Docker installation
+- **OS**: Linux (Ubuntu 20.04+ recommended)
+- **Docker**: Version 20.10+
+- **Docker Compose**: Version 2.0+
+- **Resources**: 4GB+ RAM, 20GB+ free disk space
+- **Network**: Internet connectivity and open ports 80, 443, 8080
 
 ### Verify System Compatibility
 ```bash
-# Check Ubuntu version
-lsb_release -a
-
-# Verify NVIDIA GPU
-nvidia-smi
+# Check Docker installation
+docker --version
+docker compose version
 
 # Check available disk space
 df -h
+
+# Check open ports
+sudo netstat -tulpn | grep -E ':80|:443|:8080'
 ```
 
 ## Architecture Overview
@@ -57,827 +66,479 @@ df -h
 
 ### 1. Clone and Setup
 ```bash
-# Create project directory
-mkdir -p ~/n8n-docker && cd ~/n8n-docker
+# Navigate to the compose directory
+cd /path/to/N8N/compose
 
-# Download configuration files (manual creation required)
-# Files needed: docker-compose.yml, .env, init.sql, traefik.yml
+# Ensure all required files are present
+ls -la
+# Should show: docker-compose.yml, .env.example, backup.sh, restore.sh, etc.
 ```
 
 ### 2. Environment Configuration
 ```bash
 # Copy and customize environment variables
 cp .env.example .env
-nano .env  # Edit with your settings
+nano .env  # Edit with your domain and credentials
+
+# Key variables to configure:
+# DOMAIN_NAME=taurak.co.uk
+# SUBDOMAIN=n8n  
+# SSL_EMAIL=admin@taurak.co.uk
+# POSTGRES_PASSWORD=your-secure-password
+# N8N_BASIC_AUTH_PASSWORD=your-admin-password
 ```
 
 ### 3. Deploy Stack
 ```bash
-# Install Docker and dependencies
-./scripts/install-dependencies.sh
-
-# Start services
-docker-compose up -d
-
-# Verify deployment
-docker-compose ps
-```
-
-### 4. Access n8n
-```bash
-# Check status
-curl -k https://localhost/healthz
-
-# Open in browser
-firefox https://n8n.localhost
-```
-
-## Detailed Setup
-
-### Step 1: Install Docker and Dependencies
-
-Create installation script:
-```bash
-#!/bin/bash
-# scripts/install-dependencies.sh
-
-set -euo pipefail
-
-echo "Installing Docker and NVIDIA Container Toolkit..."
-
-# Update system
-sudo apt update && sudo apt upgrade -y
-
-# Install dependencies
-sudo apt install -y \
-    apt-transport-https \
-    ca-certificates \
-    curl \
-    gnupg \
-    lsb-release \
-    software-properties-common \
-    jq
-
-# Install Docker
-if ! command -v docker &> /dev/null; then
-    echo "Installing Docker..."
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-    sudo apt update
-    sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-    sudo usermod -aG docker $USER
-    echo "Docker installed. Please log out and back in to use Docker without sudo."
-fi
-
-# Install NVIDIA Container Toolkit
-if ! command -v nvidia-container-toolkit &> /dev/null; then
-    echo "Installing NVIDIA Container Toolkit..."
-    distribution=$(. /etc/os-release;echo $ID$VERSION_ID) \
-        && curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
-        && curl -s -L https://nvidia.github.io/libnvidia-container/$distribution/libnvidia-container.list | \
-            sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
-            sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-    sudo apt update
-    sudo apt install -y nvidia-container-toolkit
-    sudo nvidia-ctk runtime configure --runtime=docker
-    sudo systemctl restart docker
-fi
-
-# Verify installations
-echo "Verifying installations..."
-docker --version
-docker compose version
-nvidia-container-toolkit --version || echo "NVIDIA Container Toolkit installed"
-
-echo "Installation complete!"
-echo "Note: If Docker was just installed, please log out and back in to use Docker without sudo."
-```
-
-### Step 2: Docker Compose Configuration
-
-#### Main Stack Configuration
-```yaml
-# docker-compose.yml
-version: '3.8'
-
-services:
-  traefik:
-    image: traefik:v3.0
-    container_name: n8n-traefik
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-    ports:
-      - "80:80"
-      - "443:443"
-      - "8080:8080"  # Traefik dashboard
-    environment:
-      - TRAEFIK_API_DASHBOARD=true
-      - TRAEFIK_API_INSECURE=true
-      - TRAEFIK_ENTRYPOINTS_WEB_ADDRESS=:80
-      - TRAEFIK_ENTRYPOINTS_WEBSECURE_ADDRESS=:443
-      - TRAEFIK_PROVIDERS_DOCKER=true
-      - TRAEFIK_PROVIDERS_DOCKER_EXPOSEDBYDEFAULT=false
-      - TRAEFIK_PROVIDERS_FILE_DIRECTORY=/etc/traefik/dynamic
-      - TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_TLSCHALLENGE=true
-      - TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_EMAIL=${ACME_EMAIL}
-      - TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_STORAGE=/letsencrypt/acme.json
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - traefik_data:/letsencrypt
-      - ./config/traefik.yml:/etc/traefik/traefik.yml:ro
-      - ./config/dynamic:/etc/traefik/dynamic:ro
-    networks:
-      - n8n-network
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.dashboard.rule=Host(`traefik.${DOMAIN_NAME}`)"
-      - "traefik.http.routers.dashboard.tls=true"
-      - "traefik.http.routers.dashboard.tls.certresolver=letsencrypt"
-
-  postgres:
-    image: postgres:16-alpine
-    container_name: n8n-postgres
-    restart: unless-stopped
-    environment:
-      - POSTGRES_DB=${POSTGRES_DB}
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_NON_ROOT_USER=${POSTGRES_NON_ROOT_USER}
-      - POSTGRES_NON_ROOT_PASSWORD=${POSTGRES_NON_ROOT_PASSWORD}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
-    networks:
-      - n8n-network
-    security_opt:
-      - no-new-privileges:true
-    user: "999:999"  # postgres user
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  n8n:
-    image: n8nio/n8n:latest
-    container_name: n8n-app
-    restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      # Database Configuration
-      - DB_TYPE=postgresdb
-      - DB_POSTGRESDB_HOST=postgres
-      - DB_POSTGRESDB_PORT=5432
-      - DB_POSTGRESDB_DATABASE=${POSTGRES_DB}
-      - DB_POSTGRESDB_USER=${POSTGRES_NON_ROOT_USER}
-      - DB_POSTGRESDB_PASSWORD=${POSTGRES_NON_ROOT_PASSWORD}
-      
-      # n8n Configuration
-      - N8N_HOST=${N8N_HOST}
-      - N8N_PORT=5678
-      - N8N_PROTOCOL=https
-      - WEBHOOK_URL=https://${N8N_HOST}
-      - GENERIC_TIMEZONE=${TIMEZONE}
-      
-      # Security
-      - N8N_BASIC_AUTH_ACTIVE=true
-      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
-      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
-      
-      # Execution
-      - EXECUTIONS_PROCESS=main
-      - EXECUTIONS_MODE=regular
-      - EXECUTIONS_DATA_SAVE_ON_ERROR=all
-      - EXECUTIONS_DATA_SAVE_ON_SUCCESS=all
-      - EXECUTIONS_DATA_MAX_AGE=336  # 14 days
-      
-      # Workflow settings
-      - N8N_METRICS=true
-      - N8N_LOG_LEVEL=info
-      - N8N_LOG_OUTPUT=console
-      
-      # GPU configuration (when needed)
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-    volumes:
-      - n8n_data:/home/node/.n8n
-    networks:
-      - n8n-network
-    user: "1000:1000"  # node user
-    security_opt:
-      - no-new-privileges:true
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.n8n.rule=Host(`${N8N_HOST}`)"
-      - "traefik.http.routers.n8n.tls=true"
-      - "traefik.http.routers.n8n.tls.certresolver=letsencrypt"
-      - "traefik.http.services.n8n.loadbalancer.server.port=5678"
-
-  watchtower:
-    image: containrrr/watchtower
-    container_name: n8n-watchtower
-    restart: unless-stopped
-    environment:
-      - WATCHTOWER_CLEANUP=true
-      - WATCHTOWER_POLL_INTERVAL=86400  # 24 hours
-      - WATCHTOWER_INCLUDE_STOPPED=true
-      - WATCHTOWER_REVIVE_STOPPED=false
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    networks:
-      - n8n-network
-    security_opt:
-      - no-new-privileges:true
-
-volumes:
-  postgres_data:
-    driver: local
-  n8n_data:
-    driver: local
-  traefik_data:
-    driver: local
-
-networks:
-  n8n-network:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.20.0.0/16
-```
-
-#### Environment Variables Template
-```bash
-# .env.example
-# Copy to .env and customize
-
-# Domain Configuration
-DOMAIN_NAME=localhost
-N8N_HOST=n8n.localhost
-ACME_EMAIL=admin@localhost
-
-# Database Configuration
-POSTGRES_DB=n8n
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=your_secure_postgres_password_here
-POSTGRES_NON_ROOT_USER=n8n_user
-POSTGRES_NON_ROOT_PASSWORD=your_secure_n8n_password_here
-
-# n8n Authentication
-N8N_BASIC_AUTH_USER=admin
-N8N_BASIC_AUTH_PASSWORD=your_secure_n8n_admin_password_here
-
-# System Configuration
-TIMEZONE=UTC
-
-# Security Notes:
-# - Use strong passwords (16+ characters, mixed case, numbers, symbols)
-# - Never commit .env file to version control
-# - Rotate passwords regularly
-# - Consider using external secret management for production
-```
-
-#### Database Initialization
-```sql
--- init.sql
--- PostgreSQL initialization script for n8n
-
--- Create non-root user for n8n application
-DO
-$do$
-BEGIN
-   IF NOT EXISTS (
-      SELECT FROM pg_catalog.pg_roles
-      WHERE  rolname = 'n8n_user') THEN
-      
-      CREATE ROLE n8n_user LOGIN PASSWORD 'your_secure_n8n_password_here';
-   END IF;
-END
-$do$;
-
--- Grant necessary permissions
-GRANT CONNECT ON DATABASE n8n TO n8n_user;
-GRANT USAGE ON SCHEMA public TO n8n_user;
-GRANT CREATE ON SCHEMA public TO n8n_user;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO n8n_user;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO n8n_user;
-
--- Create custom application schema (optional)
-CREATE SCHEMA IF NOT EXISTS app_data;
-GRANT USAGE ON SCHEMA app_data TO n8n_user;
-GRANT CREATE ON SCHEMA app_data TO n8n_user;
-ALTER DEFAULT PRIVILEGES IN SCHEMA app_data GRANT ALL ON TABLES TO n8n_user;
-ALTER DEFAULT PRIVILEGES IN SCHEMA app_data GRANT ALL ON SEQUENCES TO n8n_user;
-
--- Example custom table for Google Sheets replacement
-CREATE TABLE IF NOT EXISTS app_data.workflow_data (
-    id SERIAL PRIMARY KEY,
-    workflow_id VARCHAR(255) NOT NULL,
-    data_type VARCHAR(100) NOT NULL,
-    data_json JSONB NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(workflow_id, data_type)
-);
-
--- Create indexes for performance
-CREATE INDEX IF NOT EXISTS idx_workflow_data_workflow_id ON app_data.workflow_data(workflow_id);
-CREATE INDEX IF NOT EXISTS idx_workflow_data_type ON app_data.workflow_data(data_type);
-CREATE INDEX IF NOT EXISTS idx_workflow_data_created_at ON app_data.workflow_data(created_at);
-
--- Example view for simplified access
-CREATE OR REPLACE VIEW app_data.latest_workflow_data AS
-SELECT DISTINCT ON (workflow_id, data_type) 
-    id, workflow_id, data_type, data_json, created_at, updated_at
-FROM app_data.workflow_data
-ORDER BY workflow_id, data_type, updated_at DESC;
-
--- Grant permissions on new objects
-GRANT ALL ON app_data.workflow_data TO n8n_user;
-GRANT ALL ON SEQUENCE app_data.workflow_data_id_seq TO n8n_user;
-GRANT SELECT ON app_data.latest_workflow_data TO n8n_user;
-
-COMMENT ON TABLE app_data.workflow_data IS 'Centralized storage for workflow data, replacing Google Sheets';
-COMMENT ON VIEW app_data.latest_workflow_data IS 'Latest version of each workflow data entry';
-```
-
-#### Traefik Configuration
-```yaml
-# config/traefik.yml
-global:
-  checkNewVersion: false
-  sendAnonymousUsage: false
-
-serversTransport:
-  insecureSkipVerify: true
-
-entryPoints:
-  web:
-    address: ":80"
-    http:
-      redirections:
-        entryPoint:
-          to: websecure
-          scheme: https
-          permanent: true
-
-  websecure:
-    address: ":443"
-
-certificatesResolvers:
-  letsencrypt:
-    acme:
-      tlsChallenge: {}
-      email: admin@localhost
-      storage: /letsencrypt/acme.json
-
-providers:
-  docker:
-    endpoint: "unix:///var/run/docker.sock"
-    exposedByDefault: false
-  file:
-    directory: /etc/traefik/dynamic
-    watch: true
-
-api:
-  dashboard: true
-  insecure: true
-
-log:
-  level: INFO
-
-accessLog: {}
-```
-
-### Step 3: Deployment Scripts
-
-#### Deployment Helper Script
-```bash
-#!/bin/bash
-# scripts/deploy.sh
-
-set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-
-echo "🚀 Deploying n8n Docker Stack..."
-
-# Check prerequisites
-if ! command -v docker &> /dev/null; then
-    echo "❌ Docker not found. Please run install-dependencies.sh first."
-    exit 1
-fi
-
-if ! docker compose version &> /dev/null; then
-    echo "❌ Docker Compose not found. Please run install-dependencies.sh first."
-    exit 1
-fi
-
-# Check environment file
-if [[ ! -f "$PROJECT_DIR/.env" ]]; then
-    echo "❌ Environment file not found. Please copy .env.example to .env and customize."
-    exit 1
-fi
-
-# Create necessary directories
-mkdir -p "$PROJECT_DIR/config/dynamic"
-
-# Generate self-signed certificates for local development
-if [[ ! -f "$PROJECT_DIR/config/dynamic/tls.yml" ]]; then
-    echo "📄 Generating self-signed certificates for local development..."
-    cat > "$PROJECT_DIR/config/dynamic/tls.yml" << EOF
-tls:
-  certificates:
-    - certFile: /etc/traefik/dynamic/localhost.crt
-      keyFile: /etc/traefik/dynamic/localhost.key
-      stores:
-        - default
-  stores:
-    default:
-      defaultCertificate:
-        certFile: /etc/traefik/dynamic/localhost.crt
-        keyFile: /etc/traefik/dynamic/localhost.key
-EOF
-
-    # Generate certificate
-    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-        -keyout "$PROJECT_DIR/config/dynamic/localhost.key" \
-        -out "$PROJECT_DIR/config/dynamic/localhost.crt" \
-        -subj "/C=US/ST=Local/L=Local/O=Local/OU=Local/CN=localhost" \
-        -addext "subjectAltName=DNS:localhost,DNS:n8n.localhost,DNS:traefik.localhost,IP:127.0.0.1"
-fi
-
-# Pull latest images
-echo "⬇️ Pulling latest Docker images..."
-docker compose pull
-
-# Deploy stack
-echo "🏗️ Starting services..."
+# Start all services
 docker compose up -d
 
-# Wait for services to be healthy
-echo "⏳ Waiting for services to start..."
-sleep 30
-
-# Check service status
-echo "🔍 Checking service status..."
-docker compose ps
-
-# Verify connectivity
-echo "🌐 Verifying connectivity..."
-if curl -k -s https://localhost/healthz > /dev/null 2>&1; then
-    echo "✅ n8n is accessible"
-else
-    echo "⚠️ n8n may still be starting up. Check logs: docker compose logs n8n"
-fi
-
-echo ""
-echo "🎉 Deployment complete!"
-echo ""
-echo "Access URLs:"
-echo "  - n8n: https://n8n.localhost"
-echo "  - Traefik Dashboard: http://localhost:8080"
-echo ""
-echo "Default credentials (change these!):"
-echo "  - Username: admin"
-echo "  - Password: (check your .env file)"
-echo ""
-echo "Useful commands:"
-echo "  - View logs: docker compose logs -f"
-echo "  - Stop services: docker compose down"
-echo "  - Restart: docker compose restart"
-echo "  - Update: docker compose pull && docker compose up -d"
-```
-
-## Database Configuration
-
-### Why PostgreSQL?
-PostgreSQL was selected as the optimal database for this deployment based on:
-
-1. **n8n Native Support**: First-class integration with n8n's execution engine
-2. **JSON/JSONB Support**: Excellent handling of workflow data structures
-3. **ACID Compliance**: Ensures data integrity for critical automation workflows
-4. **Performance**: Superior query optimization for complex workflow data
-5. **Ecosystem**: Rich extension ecosystem (PostGIS, TimescaleDB, etc.)
-6. **Security**: Robust authentication and authorization mechanisms
-
-### Database Schema Design
-
-The minimal schema supports:
-- **Workflow Metadata**: Execution history, performance metrics
-- **Custom Application Data**: Replacement for Google Sheets functionality
-- **User Management**: Credentials and permissions
-- **Audit Logging**: Change tracking and compliance
-
-### Connection Configuration
-
-n8n connects to PostgreSQL using environment variables:
-```bash
-DB_TYPE=postgresdb
-DB_POSTGRESDB_HOST=postgres
-DB_POSTGRESDB_PORT=5432
-DB_POSTGRESDB_DATABASE=n8n
-DB_POSTGRESDB_USER=n8n_user
-DB_POSTGRESDB_PASSWORD=your_secure_password
-```
-
-## Workflow Migration
-
-### Replacing Google Sheets Nodes
-
-#### 1. Identify Google Sheets Operations
-```bash
-# Export existing workflows
-docker exec n8n-app n8n export:workflow --all --output=/tmp/workflows.json
-
-# Search for Google Sheets nodes
-grep -r "googleSheets" /path/to/workflows/
-```
-
-#### 2. Database Operations Mapping
-| Google Sheets Operation | PostgreSQL Equivalent |
-|------------------------|----------------------|
-| Read rows | `SELECT * FROM table WHERE conditions` |
-| Append row | `INSERT INTO table (columns) VALUES (values)` |
-| Update row | `UPDATE table SET column=value WHERE id=?` |
-| Delete row | `DELETE FROM table WHERE id=?` |
-| Lookup value | `SELECT column FROM table WHERE condition LIMIT 1` |
-
-#### 3. Migration Example
-
-**Before (Google Sheets Node):**
-```json
-{
-  "name": "Google Sheets",
-  "type": "n8n-nodes-base.googleSheets",
-  "parameters": {
-    "operation": "append",
-    "documentId": "your-sheet-id",
-    "sheetName": "Sheet1",
-    "columns": ["name", "email", "status"]
-  }
-}
-```
-
-**After (PostgreSQL Node):**
-```json
-{
-  "name": "PostgreSQL",
-  "type": "n8n-nodes-base.postgres",
-  "parameters": {
-    "operation": "insert",
-    "schema": "app_data",
-    "table": "workflow_data",
-    "columns": "workflow_id, data_type, data_json",
-    "additionalFields": {
-      "mode": "independently"
-    }
-  }
-}
-```
-
-#### 4. Data Transformation
-```javascript
-// n8n Code node for data transformation
-const items = $input.all();
-
-return items.map(item => {
-  return {
-    workflow_id: $workflow.id,
-    data_type: 'user_submission',
-    data_json: JSON.stringify({
-      name: item.json.name,
-      email: item.json.email,
-      status: item.json.status,
-      submitted_at: new Date().toISOString()
-    })
-  };
-});
-```
-
-## Security Checklist
-
-### Container Security
-- ✅ Non-root user execution (n8n: 1000:1000, postgres: 999:999)
-- ✅ Read-only root filesystem where possible
-- ✅ No new privileges security option
-- ✅ Minimal base images (Alpine Linux)
-- ✅ Regular security updates via Watchtower
-
-### Network Security
-- ✅ Isolated Docker network (172.20.0.0/16)
-- ✅ No direct external database access
-- ✅ SSL/TLS encryption for all external traffic
-- ✅ Internal service communication only
-
-### Data Security
-- ✅ Environment variable-based secrets
-- ✅ PostgreSQL password authentication
-- ✅ n8n basic authentication enabled
-- ✅ Encrypted data at rest (volume encryption)
-- ✅ SSL certificate management
-
-### Access Control
-- ✅ Traefik dashboard behind authentication
-- ✅ PostgreSQL non-root application user
-- ✅ Principle of least privilege
-- ✅ Regular credential rotation
-
-### Monitoring
-- ✅ Health checks for all services
-- ✅ Log aggregation and retention
-- ✅ Resource usage monitoring
-- ✅ Automated backup verification
-
-## Operations Guide
-
-### Daily Operations
-
-#### Service Management
-```bash
 # Check service status
 docker compose ps
 
 # View logs
-docker compose logs -f n8n
-docker compose logs -f postgres
-docker compose logs -f traefik
+docker compose logs -f
+```
 
-# Restart specific service
-docker compose restart n8n
+### 4. Access n8n
+- **n8n Interface**: `https://n8n.taurak.co.uk`
+- **Traefik Dashboard**: `http://localhost:8081`
+- **Default Login**: Username from `N8N_BASIC_AUTH_USER`, Password from `N8N_BASIC_AUTH_PASSWORD`
 
-# Update services
-docker compose pull
+## Service Architecture
+
+### Container Stack
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Docker Host                              │
+├─────────────────────────────────────────────────────────────┤
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐         │
+│  │   Traefik   │  │     n8n     │  │ PostgreSQL  │         │
+│  │   (Proxy)   │  │ (Workflow)  │  │ (Database)  │         │
+│  │  :80/:443   │  │    :5678    │  │   :5432     │         │
+│  └─────────────┘  └─────────────┘  └─────────────┘         │
+│         │                 │                 │              │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │               Docker Network                       │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  ┌─────────────┐                                           │
+│  │   Backup    │  Volumes:                                 │
+│  │ (Scheduled) │  - n8n_data (workflows, credentials)     │
+│  │  Alpine     │  - postgres_data (database)              │
+│  └─────────────┘  - traefik_data (SSL certificates)       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Component Details
+
+#### Traefik (Reverse Proxy)
+- **Ports**: 8080 (HTTP), 8443 (HTTPS), 8081 (Dashboard)
+- **Features**: Automatic SSL certificates, HTTP to HTTPS redirect
+- **Configuration**: Routes traffic to n8n based on domain/subdomain
+
+#### n8n (Workflow Engine)
+- **Port**: 5678 (internal)
+- **Database**: PostgreSQL backend
+- **Authentication**: Basic auth enabled
+- **Features**: Runners enabled for scalable execution
+
+#### PostgreSQL (Database)
+- **Port**: 5432 (internal only)
+- **Version**: 16
+- **Health Check**: Automatic readiness verification
+- **Data Persistence**: Docker volume
+
+#### Backup Service (Automated)
+- **Schedule**: Daily at 2:00 AM (configurable via cron)
+- **Retention**: 30 days (configurable)
+- **Components**: PostgreSQL dump, n8n data volume, configuration files
+- **Storage**: `./backups` directory
+
+## Backup and Restore
+
+### Automated Backup System
+
+The stack includes an automated backup service that runs daily at 2:00 AM and creates comprehensive backups of all important data.
+
+#### Backup Components
+The backup system captures:
+1. **PostgreSQL Database**: Complete n8n database dump
+2. **n8n Data Volume**: Workflows, credentials, and settings
+3. **Local Files**: Content in `./local-files` directory
+4. **Configuration**: `docker-compose.yml` and `.env` files
+
+#### Backup Configuration
+```yaml
+# Backup service configuration in docker-compose.yml
+backup:
+  image: alpine:latest
+  restart: "no"
+  command: >
+    sh -c "
+      apk add --no-cache dcron postgresql-client &&
+      echo '0 2 * * * cd /app && ./backup.sh' | crontab - &&
+      crond -f -l 2
+    "
+  volumes:
+    - .:/app
+    - ./backups:/backups
+    - n8n_data:/n8n_data:ro
+    - /var/run/docker.sock:/var/run/docker.sock:ro
+  environment:
+    - POSTGRES_USER=${POSTGRES_USER:-n8n}
+    - POSTGRES_DB=${POSTGRES_DB:-n8n}
+```
+
+#### Backup Schedule
+- **Frequency**: Daily at 2:00 AM (configurable in cron expression)
+- **Retention**: 30 days (configurable in backup.sh)
+- **Storage**: `./backups` directory with timestamped files
+
+### Manual Backup
+
+#### Run Immediate Backup
+```bash
+# Run manual backup
+./backup-manual.sh
+
+# Or run backup script directly
+./backup.sh
+```
+
+#### Backup Script Details
+The `backup.sh` script performs the following operations:
+
+1. **PostgreSQL Backup**:
+   ```bash
+   docker compose exec -T postgres pg_dump -U "${POSTGRES_USER:-n8n}" "${POSTGRES_DB:-n8n}" > "$BACKUP_DIR/postgres_${DATE}.sql"
+   ```
+
+2. **n8n Data Volume Backup**:
+   ```bash
+   docker run --rm \
+     -v ${COMPOSE_PROJECT_NAME}_n8n_data:/data:ro \
+     -v "$BACKUP_DIR":/backup \
+     alpine:latest \
+     tar czf "/backup/n8n_data_${DATE}.tar.gz" -C /data .
+   ```
+
+3. **Configuration Files**:
+   ```bash
+   cp docker-compose.yml "$BACKUP_DIR/docker-compose_${DATE}.yml"
+   cp .env "$BACKUP_DIR/env_${DATE}.txt"
+   ```
+
+4. **Cleanup Old Backups**:
+   ```bash
+   find "$BACKUP_DIR" -name "*.sql" -mtime +$RETENTION_DAYS -delete
+   find "$BACKUP_DIR" -name "*.tar.gz" -mtime +$RETENTION_DAYS -delete
+   ```
+
+### Restore Process
+
+#### List Available Backups
+```bash
+# View available backups
+ls -la ./backups/backup_info_*.txt
+
+# Check backup details
+cat ./backups/backup_info_YYYYMMDD_HHMMSS.txt
+```
+
+#### Restore from Backup
+```bash
+# Restore using the restore script
+./restore.sh YYYYMMDD_HHMMSS
+
+# Example: Restore from backup created on August 14, 2025 at 00:01:31
+./restore.sh 20250814_000131
+```
+
+#### Restore Script Process
+The `restore.sh` script performs these operations:
+
+1. **Validation**: Checks if backup files exist
+2. **Confirmation**: Prompts user to confirm restoration
+3. **Service Stop**: Stops all services safely
+4. **Database Restore**:
+   ```bash
+   # Recreate database
+   docker compose exec postgres psql -U postgres -c "DROP DATABASE IF EXISTS \"${POSTGRES_DB}\""
+   docker compose exec postgres psql -U postgres -c "CREATE DATABASE \"${POSTGRES_DB}\""
+   
+   # Restore from backup
+   docker compose exec -T postgres psql -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" < backup_file.sql
+   ```
+5. **Volume Restore**:
+   ```bash
+   docker run --rm \
+     -v compose_n8n_data:/data \
+     -v "$(pwd)/backups":/backup \
+     alpine:latest \
+     sh -c "rm -rf /data/* && tar xzf /backup/n8n_data_${DATE}.tar.gz -C /data"
+   ```
+6. **Service Restart**: Starts all services and verifies functionality
+
+#### Manual Restore Steps
+If you need to restore manually:
+
+```bash
+# 1. Stop services
+docker compose down
+
+# 2. Start only PostgreSQL
+docker compose up -d postgres
+
+# 3. Restore database
+docker compose exec -T postgres psql -U postgres -d postgres -c "DROP DATABASE IF EXISTS \"n8n\""
+docker compose exec -T postgres psql -U postgres -d postgres -c "CREATE DATABASE \"n8n\""
+docker compose exec -T postgres psql -U postgres -d n8n < ./backups/postgres_YYYYMMDD_HHMMSS.sql
+
+# 4. Restore n8n data
+docker run --rm \
+  -v compose_n8n_data:/data \
+  -v "$(pwd)/backups":/backup \
+  alpine:latest \
+  sh -c "rm -rf /data/* && tar xzf /backup/n8n_data_YYYYMMDD_HHMMSS.tar.gz -C /data"
+
+# 5. Start all services
 docker compose up -d
 ```
 
-#### Database Operations
+### Backup Monitoring
+
+#### Check Backup Status
 ```bash
-# Connect to PostgreSQL
-docker exec -it n8n-postgres psql -U postgres -d n8n
+# View backup service logs
+docker compose logs backup
 
-# Backup database
-docker exec n8n-postgres pg_dump -U postgres n8n > backup_$(date +%Y%m%d_%H%M%S).sql
+# Check if backup service is running
+docker compose ps backup
 
-# Restore database
-docker exec -i n8n-postgres psql -U postgres -d n8n < backup_file.sql
-
-# Monitor database performance
-docker exec n8n-postgres psql -U postgres -d n8n -c "
-SELECT schemaname,tablename,attname,n_distinct,correlation 
-FROM pg_stats WHERE tablename = 'workflow_data';"
-```
-
-### Backup Procedures
-
-#### Automated Backup Script
-```bash
-#!/bin/bash
-# scripts/backup.sh
-
-set -euo pipefail
-
-BACKUP_DIR="./backups"
-DATE=$(date +%Y%m%d_%H%M%S)
-
-mkdir -p "$BACKUP_DIR"
-
-echo "🗄️ Creating backup for $DATE..."
-
-# Backup database
-echo "📊 Backing up PostgreSQL database..."
-docker exec n8n-postgres pg_dump -U postgres n8n | gzip > "$BACKUP_DIR/postgres_$DATE.sql.gz"
-
-# Backup n8n data
-echo "⚙️ Backing up n8n data..."
-docker run --rm -v n8n-docker_n8n_data:/data -v "$PWD/$BACKUP_DIR":/backup alpine tar czf /backup/n8n_data_$DATE.tar.gz -C /data .
-
-# Backup configuration
-echo "📝 Backing up configuration..."
-tar czf "$BACKUP_DIR/config_$DATE.tar.gz" docker-compose.yml .env config/
-
-# Cleanup old backups (keep last 7 days)
-find "$BACKUP_DIR" -name "*.gz" -mtime +7 -delete
-
-echo "✅ Backup completed: $BACKUP_DIR"
-echo "📦 Files created:"
-ls -lh "$BACKUP_DIR"/*$DATE*
+# List recent backups
+ls -la ./backups/ | head -10
 ```
 
 #### Backup Verification
 ```bash
-#!/bin/bash
-# scripts/verify-backup.sh
+# Verify backup file integrity
+gzip -t ./backups/n8n_data_YYYYMMDD_HHMMSS.tar.gz
+psql -f ./backups/postgres_YYYYMMDD_HHMMSS.sql --set ON_ERROR_STOP=on --quiet
 
-BACKUP_FILE="$1"
-
-if [[ -z "$BACKUP_FILE" ]]; then
-    echo "Usage: $0 <backup_file.sql.gz>"
-    exit 1
-fi
-
-echo "🔍 Verifying backup: $BACKUP_FILE"
-
-# Test database backup integrity
-gunzip -t "$BACKUP_FILE" && echo "✅ Backup file is valid"
-
-# Test restore capability (dry run)
-gunzip -c "$BACKUP_FILE" | head -20
-echo "✅ Backup content verified"
+# Check backup sizes
+du -h ./backups/
 ```
 
-### Monitoring and Alerts
+### Backup Best Practices
 
-#### Health Check Script
+1. **Regular Testing**: Test restore procedures monthly
+2. **Off-site Storage**: Copy backups to external storage regularly
+3. **Monitoring**: Set up alerts for backup failures
+4. **Retention**: Adjust retention period based on storage capacity
+5. **Encryption**: Consider encrypting backups for sensitive data
+
+#### Example Backup Monitoring Script
 ```bash
 #!/bin/bash
-# scripts/health-check.sh
+# scripts/check-backups.sh
 
-set -euo pipefail
+BACKUP_DIR="./backups"
+TODAY=$(date +%Y%m%d)
 
-echo "🏥 Running health checks..."
-
-# Check Docker services
-if ! docker compose ps | grep -q "Up"; then
-    echo "❌ Some services are not running"
-    docker compose ps
+# Check if today's backup exists
+if ! ls ${BACKUP_DIR}/postgres_${TODAY}_*.sql >/dev/null 2>&1; then
+    echo "WARNING: No backup found for today ($TODAY)"
     exit 1
 fi
 
-# Check n8n accessibility
-if ! curl -k -s -f https://localhost > /dev/null; then
-    echo "❌ n8n is not accessible"
+# Check backup file sizes
+LATEST_BACKUP=$(ls ${BACKUP_DIR}/postgres_${TODAY}_*.sql | tail -1)
+BACKUP_SIZE=$(stat -c%s "$LATEST_BACKUP")
+
+if [ $BACKUP_SIZE -lt 1000000 ]; then # Less than 1MB
+    echo "WARNING: Backup file seems too small: $BACKUP_SIZE bytes"
     exit 1
 fi
 
-# Check database connectivity
-if ! docker exec n8n-postgres pg_isready -U postgres -d n8n > /dev/null; then
-    echo "❌ PostgreSQL is not ready"
-    exit 1
-fi
-
-# Check disk space
-DISK_USAGE=$(df / | tail -1 | awk '{print $5}' | sed 's/%//')
-if [[ $DISK_USAGE -gt 80 ]]; then
-    echo "⚠️ Disk usage is ${DISK_USAGE}% (>80%)"
-fi
-
-# Check memory usage
-MEMORY_USAGE=$(free | grep '^Mem:' | awk '{printf "%.0f", $3/$2*100}')
-if [[ $MEMORY_USAGE -gt 90 ]]; then
-    echo "⚠️ Memory usage is ${MEMORY_USAGE}% (>90%)"
-fi
-
-echo "✅ All health checks passed"
+echo "Backup check passed for $TODAY"
 ```
 
-### Performance Optimization
+## Operations Guide
 
-#### PostgreSQL Tuning
-```sql
--- Performance optimization queries
--- Run these in PostgreSQL to optimize for n8n workloads
+### Service Management
 
--- Analyze table statistics
-ANALYZE;
+#### Basic Operations
+```bash
+# Check service status
+docker compose ps
 
--- Check slow queries
-SELECT query, calls, total_time, mean_time
+# View logs for all services
+docker compose logs -f
+
+# View logs for specific service
+docker compose logs -f n8n
+docker compose logs -f postgres
+docker compose logs -f traefik
+docker compose logs -f backup
+
+# Restart specific service
+docker compose restart n8n
+
+# Stop all services
+docker compose down
+
+# Start all services
+docker compose up -d
+
+# Update services to latest images
+docker compose pull
+docker compose up -d
+```
+
+#### Service Health Checks
+```bash
+# Check n8n accessibility
+curl -k -I https://n8n.${DOMAIN_NAME:-localhost}
+
+# Check PostgreSQL connection
+docker compose exec postgres pg_isready -U "${POSTGRES_USER:-n8n}" -d "${POSTGRES_DB:-n8n}"
+
+# Check container resource usage
+docker stats
+
+# Check disk usage
+df -h
+du -sh ./backups
+```
+
+### Database Operations
+
+#### PostgreSQL Management
+```bash
+# Connect to PostgreSQL as admin
+docker compose exec postgres psql -U postgres -d n8n
+
+# Connect as n8n application user
+docker compose exec postgres psql -U "${POSTGRES_USER:-n8n}" -d "${POSTGRES_DB:-n8n}"
+
+# View database size and tables
+docker compose exec postgres psql -U postgres -d n8n -c "
+SELECT schemaname, tablename, 
+       pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) as size
+FROM pg_tables 
+WHERE schemaname = 'public' 
+ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC;"
+
+# Check active connections
+docker compose exec postgres psql -U postgres -d n8n -c "
+SELECT pid, usename, application_name, client_addr, state, query_start 
+FROM pg_stat_activity 
+WHERE datname = 'n8n';"
+```
+
+#### Database Maintenance
+```bash
+# Analyze database performance
+docker compose exec postgres psql -U postgres -d n8n -c "
+SELECT schemaname, tablename, attname, n_distinct, correlation 
+FROM pg_stats 
+WHERE tablename LIKE '%execution%' 
+ORDER BY tablename, attname;"
+
+# Vacuum and analyze (maintenance)
+docker compose exec postgres psql -U postgres -d n8n -c "VACUUM ANALYZE;"
+
+# Check database locks
+docker compose exec postgres psql -U postgres -d n8n -c "
+SELECT blocked_locks.pid AS blocked_pid,
+       blocked_activity.usename AS blocked_user,
+       blocking_locks.pid AS blocking_pid,
+       blocking_activity.usename AS blocking_user,
+       blocked_activity.query AS blocked_statement,
+       blocking_activity.query AS current_statement_in_blocking_process
+FROM pg_catalog.pg_locks blocked_locks
+JOIN pg_catalog.pg_stat_activity blocked_activity ON blocked_activity.pid = blocked_locks.pid
+JOIN pg_catalog.pg_locks blocking_locks ON blocking_locks.locktype = blocked_locks.locktype
+JOIN pg_catalog.pg_stat_activity blocking_activity ON blocking_activity.pid = blocking_locks.pid
+WHERE NOT blocked_locks.granted;"
+```
+
+### Environment Management
+
+#### Environment Variables
+```bash
+# View current environment configuration (excluding passwords)
+grep -v PASSWORD .env
+
+# Update environment variables
+# 1. Edit .env file
+nano .env
+
+# 2. Recreate services with new configuration
+docker compose up -d --force-recreate
+
+# 3. Verify changes
+docker compose config
+```
+
+#### SSL Certificate Management
+```bash
+# Check certificate status
+docker compose exec traefik ls -la /letsencrypt/
+
+# View certificate expiration
+openssl x509 -in config/dynamic/localhost.crt -text -noout | grep -A2 "Validity"
+
+# Force certificate renewal (for Let's Encrypt)
+docker compose restart traefik
+
+# Generate new self-signed certificates
+rm -f config/dynamic/localhost.*
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+    -keyout config/dynamic/localhost.key \
+    -out config/dynamic/localhost.crt \
+    -subj "/CN=localhost" \
+    -addext "subjectAltName=DNS:localhost,DNS:n8n.localhost,IP:127.0.0.1"
+```
+
+### Performance Monitoring
+
+#### Resource Usage
+```bash
+# Monitor container resources
+docker stats --format "table {{.Container}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}\t{{.BlockIO}}"
+
+# Check volume sizes
+docker system df -v
+
+# Monitor n8n workflow executions
+docker compose exec postgres psql -U postgres -d n8n -c "
+SELECT 
+    DATE(\"startedAt\") as execution_date,
+    COUNT(*) as total_executions,
+    COUNT(CASE WHEN finished = true THEN 1 END) as completed,
+    COUNT(CASE WHEN \"stoppedAt\" IS NOT NULL AND finished = false THEN 1 END) as failed
+FROM execution_entity 
+WHERE \"startedAt\" > NOW() - INTERVAL '7 days'
+GROUP BY DATE(\"startedAt\")
+ORDER BY execution_date DESC;"
+```
+
+#### Log Analysis
+```bash
+# Find errors in n8n logs
+docker compose logs n8n 2>&1 | grep -i error | tail -20
+
+# Monitor PostgreSQL slow queries (if enabled)
+docker compose exec postgres psql -U postgres -d n8n -c "
+SELECT query, calls, total_time, mean_time, rows
 FROM pg_stat_statements
 ORDER BY total_time DESC
-LIMIT 10;
+LIMIT 10;"
 
--- Optimize n8n execution data retention
-DELETE FROM execution_entity 
-WHERE "startedAt" < NOW() - INTERVAL '30 days'
-AND finished = true;
-
--- Vacuum and reindex
-VACUUM ANALYZE;
-REINDEX DATABASE n8n;
-```
-
-#### Docker Resource Limits
-```yaml
-# Add to docker-compose.yml services
-deploy:
-  resources:
-    limits:
-      memory: 2G
-      cpus: '1.5'
-    reservations:
-      memory: 512M
-      cpus: '0.5'
+# Check disk I/O performance
+iostat -x 1 5  # Requires sysstat package
 ```
 
 ## Troubleshooting
@@ -888,220 +549,570 @@ deploy:
 **Symptoms:**
 - n8n container restarts repeatedly
 - Database connection errors in logs
+- "Connection refused" errors
+
+**Diagnosis:**
+```bash
+# Check PostgreSQL logs
+docker compose logs postgres | tail -50
+
+# Test database connectivity
+docker compose exec postgres pg_isready -U "${POSTGRES_USER:-n8n}" -d "${POSTGRES_DB:-n8n}"
+
+# Check if PostgreSQL is accepting connections
+docker compose exec n8n nc -zv postgres 5432
+```
 
 **Solutions:**
 ```bash
-# Check PostgreSQL logs
-docker compose logs postgres
+# 1. Verify database credentials in .env file
+grep -E "POSTGRES_.*=" .env
 
-# Verify database credentials
-docker exec n8n-postgres psql -U n8n_user -d n8n -c "SELECT 1;"
+# 2. Check PostgreSQL service health
+docker compose ps postgres
 
-# Reset database password
-docker exec -it n8n-postgres psql -U postgres -c "ALTER USER n8n_user PASSWORD 'new_password';"
+# 3. Restart PostgreSQL service
+docker compose restart postgres
+
+# 4. If database is corrupted, restore from backup
+./restore.sh YYYYMMDD_HHMMSS
+
+# 5. Reset database (WARNING: This will delete all data)
+docker compose down
+docker volume rm compose_postgres_data
+docker compose up -d
 ```
 
 #### 2. SSL Certificate Issues
 **Symptoms:**
 - Browser security warnings
+- "SSL_ERROR_SELF_SIGNED_CERT" errors
 - Traefik certificate errors
 
-**Solutions:**
+**Diagnosis:**
 ```bash
-# Regenerate self-signed certificates
-rm config/dynamic/localhost.*
-./scripts/deploy.sh
+# Check certificate files
+ls -la config/dynamic/
 
-# Check Traefik configuration
-docker compose logs traefik | grep -i certificate
+# Test SSL connection
+openssl s_client -connect localhost:443 -servername n8n.localhost
 
-# Force certificate refresh
-docker compose restart traefik
+# Check Traefik logs for certificate errors
+docker compose logs traefik | grep -i cert
 ```
 
-#### 3. GPU Not Accessible
+**Solutions:**
+```bash
+# 1. Regenerate self-signed certificates
+rm -f config/dynamic/localhost.*
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+    -keyout config/dynamic/localhost.key \
+    -out config/dynamic/localhost.crt \
+    -subj "/CN=localhost" \
+    -addext "subjectAltName=DNS:localhost,DNS:n8n.localhost,IP:127.0.0.1"
+
+# 2. Restart Traefik
+docker compose restart traefik
+
+# 3. For production, ensure DNS points to your server
+# and update DOMAIN_NAME in .env file
+
+# 4. Check browser certificate acceptance
+# Add exception for self-signed certificates in browser
+```
+
+#### 3. Backup Service Not Working
 **Symptoms:**
-- NVIDIA runtime errors
-- GPU nodes fail in n8n workflows
+- No recent backup files
+- Backup container not running
+- Cron job failures
+
+**Diagnosis:**
+```bash
+# Check backup service status
+docker compose ps backup
+
+# View backup service logs
+docker compose logs backup
+
+# Check if backup files are being created
+ls -la ./backups/ | head -10
+
+# Test backup script manually
+./backup-manual.sh
+```
 
 **Solutions:**
 ```bash
-# Verify NVIDIA Docker runtime
-docker run --rm --gpus all nvidia/cuda:11.0-base nvidia-smi
+# 1. Restart backup service
+docker compose restart backup
 
-# Check container GPU access
-docker exec n8n-app nvidia-smi
+# 2. Check cron configuration in backup container
+docker compose exec backup crontab -l
 
-# Restart Docker daemon
-sudo systemctl restart docker
-docker compose up -d
+# 3. Run backup manually to test
+docker compose exec backup /app/backup.sh
+
+# 4. Check disk space for backups
+df -h .
+du -sh ./backups
+
+# 5. Fix permissions if needed
+chmod +x backup.sh backup-manual.sh restore.sh
 ```
 
 #### 4. Performance Issues
 **Symptoms:**
 - Slow workflow execution
 - High memory usage
-- Database locks
+- Database timeouts
+- Browser timeouts
 
-**Solutions:**
+**Diagnosis:**
 ```bash
-# Monitor resource usage
+# Check resource usage
 docker stats
 
-# Check database performance
-docker exec n8n-postgres psql -U postgres -d n8n -c "
+# Monitor system resources
+top
+free -h
+df -h
+
+# Check PostgreSQL performance
+docker compose exec postgres psql -U postgres -d n8n -c "
 SELECT pid, now() - pg_stat_activity.query_start AS duration, query 
 FROM pg_stat_activity 
-WHERE (now() - pg_stat_activity.query_start) > interval '5 minutes';"
-
-# Optimize database
-docker exec n8n-postgres psql -U postgres -d n8n -c "VACUUM ANALYZE;"
-
-# Scale resources
-# Edit docker-compose.yml to increase memory/CPU limits
-docker compose up -d
+WHERE (now() - pg_stat_activity.query_start) > interval '1 minute';"
 ```
-
-#### 5. Data Corruption or Loss
-**Symptoms:**
-- Workflows disappear
-- Database connection failures
-- Data inconsistencies
 
 **Solutions:**
 ```bash
-# Check data integrity
-docker exec n8n-postgres psql -U postgres -d n8n -c "
-SELECT schemaname, tablename, pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) as size
-FROM pg_tables WHERE schemaname = 'public'
-ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC;"
+# 1. Optimize PostgreSQL
+docker compose exec postgres psql -U postgres -d n8n -c "VACUUM ANALYZE;"
 
-# Restore from backup
-./scripts/restore-backup.sh backups/postgres_YYYYMMDD_HHMMSS.sql.gz
+# 2. Clean up old executions
+docker compose exec postgres psql -U postgres -d n8n -c "
+DELETE FROM execution_entity 
+WHERE \"startedAt\" < NOW() - INTERVAL '30 days'
+AND finished = true;"
 
-# Rebuild from clean state
-docker compose down -v
+# 3. Restart services to clear memory
+docker compose restart
+
+# 4. Increase resource limits in docker-compose.yml
+# Add under each service:
+# deploy:
+#   resources:
+#     limits:
+#       memory: 2G
+#       cpus: '1.5'
+
+# 5. Monitor and optimize workflows
+# Check n8n executions tab for slow workflows
+```
+
+#### 5. Data Loss or Corruption
+**Symptoms:**
+- Workflows disappear
+- Credentials missing
+- Database errors
+- Volume mount issues
+
+**Diagnosis:**
+```bash
+# Check data volumes
+docker volume ls | grep compose
+
+# Inspect volume contents
+docker run --rm -v compose_n8n_data:/data alpine ls -la /data
+
+# Check database integrity
+docker compose exec postgres psql -U postgres -d n8n -c "
+SELECT pg_database_size('n8n') as db_size;"
+```
+
+**Solutions:**
+```bash
+# 1. Restore from latest backup
+./restore.sh $(ls ./backups/backup_info_*.txt | sed 's/.*backup_info_\(.*\)\.txt/\1/' | sort -r | head -1)
+
+# 2. If no backup available, check volume backup
+ls -la ./backups/n8n_data_*.tar.gz | tail -1
+
+# 3. Rebuild from clean state (last resort)
+docker compose down -v  # WARNING: This deletes all data
 docker compose up -d
+
+# 4. Prevent future data loss
+# - Set up regular backup monitoring
+# - Test restore procedures monthly
+# - Consider off-site backup storage
 ```
 
-### Log Analysis
+### Debugging Tools
 
-#### Centralized Logging Setup
+#### Container Inspection
 ```bash
-# View all logs with timestamps
-docker compose logs -f -t
+# Enter container shells for debugging
+docker compose exec n8n /bin/sh
+docker compose exec postgres /bin/bash
+docker compose exec traefik /bin/sh
 
-# Filter specific service logs
-docker compose logs -f n8n | grep -i error
+# Check container configurations
+docker compose config
 
-# Export logs for analysis
-docker compose logs --no-color > system_logs_$(date +%Y%m%d).log
+# Inspect running containers
+docker inspect compose_n8n_1
+docker inspect compose_postgres_1
 ```
 
-#### Log Rotation Configuration
-```bash
-# Add to docker-compose.yml for each service
-logging:
-  driver: "json-file"
-  options:
-    max-size: "10m"
-    max-file: "3"
-```
-
-### Network Diagnostics
-
-#### Connectivity Testing
+#### Network Debugging
 ```bash
 # Test internal network connectivity
-docker exec n8n-app ping postgres
-docker exec n8n-app nc -zv postgres 5432
+docker compose exec n8n ping postgres
+docker compose exec n8n nc -zv postgres 5432
 
-# Test external connectivity
-curl -k -v https://localhost
-curl -v http://localhost:8080  # Traefik dashboard
+# Check external connectivity
+curl -k -v https://n8n.taurak.co.uk
+curl -v http://localhost:8081  # Traefik dashboard
 
-# Check DNS resolution
-docker exec n8n-app nslookup postgres
+# List network configuration
+docker network ls
+docker network inspect compose_default
 ```
 
-#### Port Conflict Resolution
+#### Log Collection
 ```bash
-# Check port usage
-sudo netstat -tulpn | grep :80
-sudo netstat -tulpn | grep :443
-sudo netstat -tulpn | grep :5432
+# Collect all logs for support
+docker compose logs --no-color > system_logs_$(date +%Y%m%d_%H%M%S).log
 
-# Modify ports in docker-compose.yml if conflicts exist
-# Example: Change "80:80" to "8080:80" for HTTP
+# Real-time log monitoring
+docker compose logs -f --tail=100
+
+# Filter logs by severity
+docker compose logs 2>&1 | grep -i "error\|warn\|fatal"
+```
+
+## Security Considerations
+
+### Container Security
+- ✅ **Non-root execution**: n8n runs as user 1000:1000, PostgreSQL as 999:999
+- ✅ **Minimal attack surface**: Alpine-based images where possible
+- ✅ **No privileged containers**: All containers run without elevated privileges
+- ✅ **Read-only filesystems**: Critical paths are read-only where feasible
+
+### Network Security
+- ✅ **Internal network isolation**: Services communicate via private Docker network
+- ✅ **No direct database access**: PostgreSQL is not exposed externally
+- ✅ **SSL/TLS encryption**: All external traffic encrypted via Traefik
+- ✅ **Secure defaults**: HTTP automatically redirects to HTTPS
+
+### Authentication & Access Control
+- ✅ **Basic authentication**: n8n protected with username/password
+- ✅ **Database user separation**: Dedicated non-admin user for n8n application
+- ✅ **Environment-based secrets**: Credentials stored in environment variables
+- ✅ **Principle of least privilege**: Each service has minimal required permissions
+
+### Data Protection
+- ✅ **Automated backups**: Daily backups with 30-day retention
+- ✅ **Data persistence**: All critical data stored in Docker volumes
+- ✅ **Backup encryption**: Consider encrypting backups for sensitive environments
+- ✅ **Access logging**: Traefik logs all access attempts
+
+### Security Best Practices
+
+#### Credential Management
+```bash
+# Use strong, unique passwords
+POSTGRES_PASSWORD=$(openssl rand -base64 32)
+N8N_BASIC_AUTH_PASSWORD=$(openssl rand -base64 32)
+
+# Store in .env file (never commit to version control)
+echo "POSTGRES_PASSWORD=${POSTGRES_PASSWORD}" >> .env
+echo "N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}" >> .env
+
+# Regular credential rotation (quarterly recommended)
+./scripts/rotate-credentials.sh
+```
+
+#### File Permissions
+```bash
+# Secure configuration files
+chmod 600 .env
+chmod 600 config/dynamic/*.key
+chmod 644 config/dynamic/*.crt
+
+# Secure backup files
+chmod 700 ./backups
+find ./backups -type f -exec chmod 600 {} \;
+```
+
+#### Network Hardening
+```bash
+# Firewall configuration (example for UFW)
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow 22/tcp    # SSH
+sudo ufw allow 80/tcp    # HTTP
+sudo ufw allow 443/tcp   # HTTPS
+sudo ufw --force enable
+
+# Monitor network connections
+ss -tulpn | grep -E ":80|:443|:5432|:5678"
 ```
 
 ## Advanced Configuration
 
-### Custom Domain Setup
+### Production Deployment
 
+#### Domain Setup
 For production deployment with a real domain:
 
-1. **Update DNS records:**
-   ```bash
-   # Point your domain to your server IP
-   n8n.yourdomain.com -> YOUR_SERVER_IP
-   ```
+```bash
+# 1. Update DNS records
+# Point your domain to your server IP:
+# n8n.taurak.co.uk -> YOUR_SERVER_IP
 
-2. **Update environment variables:**
-   ```bash
-   DOMAIN_NAME=yourdomain.com
-   N8N_HOST=n8n.yourdomain.com
-   ACME_EMAIL=admin@yourdomain.com
-   ```
+# 2. Update environment variables
+cat >> .env << EOF
+DOMAIN_NAME=taurak.co.uk
+SUBDOMAIN=n8n
+SSL_EMAIL=admin@taurak.co.uk
+EOF
 
-3. **Enable Let's Encrypt:**
-   ```yaml
-   # Traefik will automatically obtain SSL certificates
-   # No additional configuration needed
-   ```
-
-### High Availability Setup
-
-For production environments requiring high availability:
-
-```yaml
-# docker-compose.ha.yml
-services:
-  postgres:
-    deploy:
-      replicas: 1
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - postgres_backup:/backup
-    
-  n8n:
-    deploy:
-      replicas: 2
-    environment:
-      - EXECUTIONS_PROCESS=main
-      - N8N_DISABLE_UI=false
+# 3. Let's Encrypt will automatically obtain SSL certificates
+docker compose up -d
 ```
 
-### Integration with External Services
+#### High Availability Setup
+For production environments requiring redundancy:
 
-#### LDAP Authentication
-```bash
-# Add to n8n environment
-N8N_AUTH_EXCLUDE_ENDPOINTS=rest,healthz
-N8N_BASIC_AUTH_ACTIVE=false
-N8N_AUTH_LDAP_ENABLED=true
-N8N_AUTH_LDAP_SERVER=ldap://your-ldap-server
-N8N_AUTH_LDAP_BIND_DN=cn=admin,dc=company,dc=com
-N8N_AUTH_LDAP_BIND_PASSWORD=your-ldap-password
+```yaml
+# docker-compose.ha.yml (example for load balancing)
+version: '3.8'
+services:
+  n8n-1:
+    image: docker.n8n.io/n8nio/n8n
+    # ... same configuration as n8n service
+    
+  n8n-2:
+    image: docker.n8n.io/n8nio/n8n
+    # ... same configuration as n8n service
+    
+  postgres-primary:
+    image: postgres:16
+    # Primary database configuration
+    
+  postgres-replica:
+    image: postgres:16
+    # Read replica configuration
 ```
 
 #### External Database
+To use an external PostgreSQL instance:
+
 ```bash
-# For connecting to external PostgreSQL
+# Update .env for external database
+cat >> .env << EOF
+# External PostgreSQL configuration
 DB_POSTGRESDB_HOST=external-postgres.company.com
 DB_POSTGRESDB_PORT=5432
 DB_POSTGRESDB_SSL_ENABLED=true
-DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED=true
+EOF
+
+# Remove postgres service from docker-compose.yml
+# Update n8n depends_on to remove postgres dependency
 ```
 
-This completes your production-ready n8n Docker setup with comprehensive database integration, security hardening, and operational procedures. The configuration is ready for immediate deployment and can be customized for your specific requirements.
+### Monitoring Integration
+
+#### Prometheus Metrics
+```yaml
+# Add to docker-compose.yml for monitoring
+prometheus:
+  image: prom/prometheus
+  ports:
+    - "9090:9090"
+  volumes:
+    - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+
+grafana:
+  image: grafana/grafana
+  ports:
+    - "3000:3000"
+  environment:
+    - GF_SECURITY_ADMIN_PASSWORD=admin
+```
+
+#### Health Check Endpoint
+```bash
+# Add health check monitoring
+curl -f https://n8n.taurak.co.uk/healthz || exit 1
+
+# Set up monitoring cron job
+echo "*/5 * * * * /path/to/health-check.sh" | crontab -
+```
+
+## Maintenance
+
+### Regular Maintenance Tasks
+
+#### Weekly Tasks
+```bash
+#!/bin/bash
+# weekly-maintenance.sh
+
+# Update container images
+docker compose pull
+
+# Clean up unused Docker resources
+docker system prune -f
+
+# Optimize database
+docker compose exec postgres psql -U postgres -d n8n -c "VACUUM ANALYZE;"
+
+# Check backup integrity
+./scripts/verify-backups.sh
+
+# Review logs for errors
+docker compose logs --since 168h 2>&1 | grep -i error > weekly_errors.log
+```
+
+#### Monthly Tasks
+```bash
+#!/bin/bash
+# monthly-maintenance.sh
+
+# Test restore procedure
+LATEST_BACKUP=$(ls ./backups/backup_info_*.txt | tail -1 | sed 's/.*backup_info_\(.*\)\.txt/\1/')
+echo "Testing restore of backup: $LATEST_BACKUP"
+# ./restore.sh $LATEST_BACKUP --dry-run
+
+# Rotate credentials
+./scripts/rotate-credentials.sh
+
+# Security scan
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy image n8nio/n8n
+
+# Performance review
+docker compose exec postgres psql -U postgres -d n8n -c "
+SELECT schemaname, tablename, pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) as size
+FROM pg_tables WHERE schemaname = 'public'
+ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC LIMIT 10;"
+```
+
+### Upgrading
+
+#### n8n Version Upgrades
+```bash
+# 1. Create backup before upgrade
+./backup-manual.sh
+
+# 2. Check for breaking changes in n8n release notes
+# https://github.com/n8n-io/n8n/releases
+
+# 3. Update to latest version
+docker compose pull n8n
+docker compose up -d n8n
+
+# 4. Verify functionality
+curl -k https://n8n.taurak.co.uk/healthz
+
+# 5. Check logs for any issues
+docker compose logs n8n | tail -50
+```
+
+#### PostgreSQL Version Upgrades
+```bash
+# Major PostgreSQL upgrades require data migration
+# 1. Full backup
+./backup-manual.sh
+
+# 2. Export data
+docker compose exec postgres pg_dumpall -U postgres > full_backup.sql
+
+# 3. Stop services and update image version
+docker compose down
+# Edit docker-compose.yml to new PostgreSQL version
+docker compose up -d postgres
+
+# 4. Import data if needed
+# docker compose exec -T postgres psql -U postgres < full_backup.sql
+```
+
+## Support and Documentation
+
+### Getting Help
+
+#### Community Resources
+- **n8n Community**: https://community.n8n.io/
+- **n8n Documentation**: https://docs.n8n.io/
+- **Docker Documentation**: https://docs.docker.com/
+- **PostgreSQL Documentation**: https://www.postgresql.org/docs/
+
+#### Log Collection for Support
+```bash
+# Collect comprehensive system information
+./scripts/collect-support-info.sh
+
+# This creates a support bundle with:
+# - Service configurations
+# - Recent logs  
+# - System information
+# - Error reports
+# - Performance metrics
+```
+
+#### Issue Reporting Template
+When reporting issues, include:
+
+1. **Environment Information**:
+   ```bash
+   docker --version
+   docker compose version
+   uname -a
+   ```
+
+2. **Service Status**:
+   ```bash
+   docker compose ps
+   docker compose config --quiet && echo "Config valid" || echo "Config invalid"
+   ```
+
+3. **Recent Logs**:
+   ```bash
+   docker compose logs --tail=100 service_name
+   ```
+
+4. **Error Details**: Specific error messages and reproduction steps
+
+### Configuration Reference
+
+#### Environment Variables Reference
+| Variable | Description | Default | Required |
+|----------|-------------|---------|----------|
+| `DOMAIN_NAME` | Base domain for services | `localhost` | Yes |
+| `SUBDOMAIN` | n8n subdomain | `n8n` | Yes |
+| `SSL_EMAIL` | Email for SSL certificates | - | Yes |
+| `POSTGRES_DB` | PostgreSQL database name | `n8n` | Yes |
+| `POSTGRES_USER` | PostgreSQL admin user | `postgres` | Yes |
+| `POSTGRES_PASSWORD` | PostgreSQL admin password | - | Yes |
+| `N8N_BASIC_AUTH_USER` | n8n admin username | `admin` | Yes |
+| `N8N_BASIC_AUTH_PASSWORD` | n8n admin password | - | Yes |
+| `GENERIC_TIMEZONE` | System timezone | `UTC` | No |
+| `N8N_RUNNERS_ENABLED` | Enable n8n runners | `true` | No |
+
+#### Port Mapping Reference
+| Service | Internal Port | External Port | Description |
+|---------|---------------|---------------|-------------|
+| Traefik | 80 | 8080 | HTTP (redirects to HTTPS) |
+| Traefik | 443 | 8443 | HTTPS |
+| Traefik | 8080 | 8081 | Dashboard |
+| n8n | 5678 | - | Web interface (via Traefik) |
+| PostgreSQL | 5432 | - | Database (internal only) |
+
+---
+
+This Docker Compose setup provides a robust, production-ready n8n installation with comprehensive backup and restore capabilities. The automated backup system ensures your workflow data is protected, while the security configurations follow best practices for container deployment.
+
+For questions or issues, refer to the troubleshooting section above or consult the n8n community resources.

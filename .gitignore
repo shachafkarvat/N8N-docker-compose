@@ -70,3 +70,27 @@ config/dynamic/
 *password*
 *secret*
 *credential*
+
+# Ignore persistent data volumes
+../data/
+
+# Ignore backup files
+backups/
+
+# Ignore environment files
+.env
+
+# Ignore credentials and sensitive config
+local-files/credentials_backup.json/
+local-files/workflows_backup.json/
+local-files/backups/
+local-files/*.json
+
+# Ignore any SQL dumps
+*.sql
+*.sql.gz
+
+# Ignore n8n config and secrets
+local-files/config.json
+local-files/creds.json
+local-files/file.json
