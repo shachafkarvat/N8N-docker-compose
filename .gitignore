@@ -101,3 +101,5 @@ init.sql
 # Additional backup files in root directory
 backup_*.sql
 *_backup.sql
+
+creds.json
