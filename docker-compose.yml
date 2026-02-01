@@ -37,8 +37,14 @@ services:
       retries: 10
 
   n8n:
-    image: docker.n8n.io/n8nio/n8n
+    image: docker.n8n.io/n8nio/n8n:stable
     restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 24G
+        reservations:
+          memory: 4G
     ports:
       - "127.0.0.1:5678:5678"
     labels:
@@ -70,6 +76,10 @@ services:
       - DB_POSTGRESDB_USER=${POSTGRES_USER:-n8n}
       - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD:-n8n}
       - N8N_RUNNERS_ENABLED=${N8N_RUNNERS_ENABLED:-true}
+      - NODE_OPTIONS=--max-old-space-size=3072
+      - N8N_PROXY_HOPS=1
+      - N8N_LOG_LEVEL=debug
+      - N8N_LOG_OUTPUT=console      
     volumes:
       - n8n_data:/home/node/.n8n
       - ./local-files:/files

@@ -6,20 +6,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a production-ready n8n workflow automation platform deployed via Docker Compose with:
 
-- **n8n**: Workflow automation engine (latest version)
-- **Traefik**: Reverse proxy with SSL termination and automatic HTTPS
-- **PostgreSQL**: Database backend (when using full setup from README)
-- **Watchtower**: Automatic container updates (when using full setup from README)
+- **n8n**: Workflow automation engine (stable version, 24G memory limit, 4G reservation)
+- **Traefik**: Reverse proxy with SSL termination and automatic HTTPS via Let's Encrypt
+- **PostgreSQL 16**: Database backend for n8n data storage
+- **Backup Service**: Alpine-based cron service for automated daily backups at 2 AM
 
-The current simplified docker-compose.yml includes just n8n and Traefik for basic deployment.
+The full stack is deployed via docker-compose.yml with all services active.
 
 ## Key Configuration Files
 
-- `docker-compose.yml`: Main service definitions
+- `docker-compose.yml`: Main service definitions (n8n, Traefik, PostgreSQL, Backup)
 - `.env`: Environment variables (contains sensitive data - never commit)
-- `config/dynamic/`: Traefik dynamic configuration and SSL certificates
+- `config/traefik.yml`: Traefik static configuration
+- `config/dynamic/`: Traefik dynamic configuration and TLS settings
 - `scripts/`: Operational scripts for deployment and maintenance
 - `local-files/`: Mounted volume for file access within n8n workflows
+- `backups/`: Backup storage directory with timestamped folders
+- `backup.sh` / `restore.sh`: Backup and restore scripts
 
 ## Common Commands
 
@@ -59,14 +62,20 @@ docker compose up -d
 
 ### Backup and Maintenance
 ```bash
-# Create backup
-./scripts/backup.sh
+# Create backup (manual)
+./backup.sh
+
+# Restore from backup
+./restore.sh
 
 # Health check
 ./scripts/health-check.sh
 
 # Access n8n container
 docker exec -it n8n /bin/sh
+
+# Access PostgreSQL
+docker exec -it compose-postgres-1 psql -U n8n -d n8n
 ```
 
 ### Debugging
@@ -86,11 +95,11 @@ openssl s_client -connect localhost:8443 -servername n8n.localhost
 
 The `.env` file contains critical configuration:
 
-- **Domain Settings**: `DOMAIN_NAME`, `SUBDOMAIN`, `N8N_HOST`
+- **Domain Settings**: `DOMAIN_NAME`, `SUBDOMAIN` (combined as `${SUBDOMAIN}.${DOMAIN_NAME}`)
 - **SSL**: `SSL_EMAIL` for Let's Encrypt certificates
-- **Authentication**: `N8N_BASIC_AUTH_USER`, `N8N_BASIC_AUTH_PASSWORD`
-- **Database**: PostgreSQL credentials (when using full setup)
+- **Database**: `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` (defaults to `n8n` if not set)
 - **Timezone**: `GENERIC_TIMEZONE`
+- **n8n Settings**: `N8N_RUNNERS_ENABLED` (defaults to true)
 
 ## Port Mapping
 
@@ -109,8 +118,10 @@ The `.env` file contains critical configuration:
 ## Volume Mounts
 
 - `n8n_data`: Persistent n8n workflow and configuration data
-- `traefik_data`: SSL certificates and Traefik data
-- `./local-files:/files`: Host directory mounted for file operations
+- `postgres_data`: PostgreSQL database files
+- `traefik_data`: SSL certificates (Let's Encrypt acme.json)
+- `./local-files:/files`: Host directory mounted for file operations in n8n
+- `./backups:/backups`: Backup storage directory
 
 ## Security Considerations
 
