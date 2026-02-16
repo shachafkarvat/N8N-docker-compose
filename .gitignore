@@ -102,4 +102,5 @@ init.sql
 backup_*.sql
 *_backup.sql
 
-creds.jsonProduction-plan/
+creds.json
+Production-plan/
