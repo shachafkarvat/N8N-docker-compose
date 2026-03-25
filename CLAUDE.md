@@ -4,160 +4,98 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Architecture Overview
 
-This is a production-ready n8n workflow automation platform deployed via Docker Compose with:
+Production n8n workflow automation platform deployed via Docker Compose:
 
-- **n8n**: Workflow automation engine (stable version, 24G memory limit, 4G reservation)
-- **Traefik**: Reverse proxy with SSL termination and automatic HTTPS via Let's Encrypt
-- **PostgreSQL 16**: Database backend for n8n data storage
-- **Backup Service**: Alpine-based cron service for automated daily backups at 2 AM
+- **n8n**: Custom-built from `n8n.Dockerfile` (base: `n8nio/n8n:stable` + cheerio npm package). 24G memory limit, 4G reservation. Runs as `node` user.
+- **Traefik**: Reverse proxy with automatic HTTPS (Let's Encrypt TLS challenge) and HTTP-to-HTTPS redirect.
+- **PostgreSQL 16**: Database backend with healthcheck. n8n waits for healthy postgres before starting.
+- **Backup Service**: Alpine container running cron (`restart: "no"` — only runs while stack is up). Daily backups at 2 AM with tiered retention (7 days all, 4 weekly Sundays, monthly 1st-of-month forever).
 
-The full stack is deployed via docker-compose.yml with all services active.
+## Custom n8n Image
 
-## Key Configuration Files
+n8n uses a custom Dockerfile (`n8n.Dockerfile`) rather than the stock image. The `NODE_FUNCTION_ALLOW_EXTERNAL=cheerio` env var in docker-compose.yml allows n8n Code nodes to `require('cheerio')`. When adding new npm packages for use in Code nodes, update both the Dockerfile and the environment variable.
 
-- `docker-compose.yml`: Main service definitions (n8n, Traefik, PostgreSQL, Backup)
-- `.env`: Environment variables (contains sensitive data - never commit)
-- `config/traefik.yml`: Traefik static configuration
-- `config/dynamic/`: Traefik dynamic configuration and TLS settings
-- `scripts/`: Operational scripts for deployment and maintenance
-- `local-files/`: Mounted volume for file access within n8n workflows
-- `backups/`: Backup storage directory with timestamped folders
-- `backup.sh` / `restore.sh`: Backup and restore scripts
+To rebuild after Dockerfile changes:
+```bash
+docker compose build n8n
+docker compose up -d n8n
+```
 
 ## Common Commands
 
-### Setup and Deployment
 ```bash
-# Install Docker and dependencies
-./scripts/install-dependencies.sh
+# Initial setup
+cp .env.example .env  # then edit with real values
+./scripts/deploy.sh   # builds, pulls, starts, verifies
 
-# Deploy the stack
-./scripts/deploy.sh
-
-# Verify setup
-./scripts/verify-setup.sh
-```
-
-### Daily Operations
-```bash
-# View service status
+# Daily operations
 docker compose ps
-
-# View logs
-docker compose logs -f n8n        # n8n application
-docker compose logs -f traefik    # proxy/SSL
-
-# Restart services
+docker compose logs -f n8n
+docker compose logs -f traefik
 docker compose restart n8n
-docker compose restart traefik
+docker compose down && docker compose up -d
 
-# Stop/start all services
-docker compose down
-docker compose up -d
-
-# Update to latest images
-docker compose pull
-docker compose up -d
-```
-
-### Backup and Maintenance
-```bash
-# Create backup (manual)
+# Manual backup
 ./backup.sh
 
-# Restore from backup
-./restore.sh
+# Restore (requires backup folder name, e.g. 20240202_143000)
+./restore.sh <backup_date>
 
-# Health check
-./scripts/health-check.sh
+# Database access
+docker exec -it compose-postgres-1 psql -U n8n -d n8n
 
-# Access n8n container
+# n8n container shell
 docker exec -it n8n /bin/sh
 
-# Access PostgreSQL
-docker exec -it compose-postgres-1 psql -U n8n -d n8n
+# Debugging
+curl -k https://n8n.localhost        # test via Traefik
+curl http://localhost:5678           # test n8n directly (localhost only)
+curl http://localhost:8081           # Traefik dashboard/API
 ```
-
-### Debugging
-```bash
-# Check connectivity
-curl -k https://n8n.localhost
-curl -k https://localhost
-
-# Check Traefik dashboard
-curl http://localhost:8081
-
-# Test SSL certificates
-openssl s_client -connect localhost:8443 -servername n8n.localhost
-```
-
-## Environment Configuration
-
-The `.env` file contains critical configuration:
-
-- **Domain Settings**: `DOMAIN_NAME`, `SUBDOMAIN` (combined as `${SUBDOMAIN}.${DOMAIN_NAME}`)
-- **SSL**: `SSL_EMAIL` for Let's Encrypt certificates
-- **Database**: `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` (defaults to `n8n` if not set)
-- **Timezone**: `GENERIC_TIMEZONE`
-- **n8n Settings**: `N8N_RUNNERS_ENABLED` (defaults to true)
 
 ## Port Mapping
 
-- `8080`: HTTP (redirects to HTTPS)
-- `8443`: HTTPS for n8n access
-- `8081`: Traefik dashboard
-- `5678`: n8n direct access (localhost only)
+| Host Port | Container Port | Service | Notes |
+|-----------|---------------|---------|-------|
+| 8080 | 80 | Traefik | HTTP, redirects to HTTPS |
+| 8443 | 443 | Traefik | HTTPS for n8n access |
+| 8081 | 8080 | Traefik | Dashboard/API (insecure mode) |
+| 5678 | 5678 | n8n | Direct access, localhost-only bind |
 
-## SSL/TLS Configuration
+## Environment Configuration
 
-- Self-signed certificates generated automatically for localhost
-- Let's Encrypt integration available for production domains
-- Traefik handles certificate management and renewal
-- Custom certificates can be placed in `config/dynamic/`
+The `.env` file drives all service configuration. Key variables (see `.env.example` for template):
+
+- `DOMAIN_NAME` / `SUBDOMAIN`: Combined as `${SUBDOMAIN}.${DOMAIN_NAME}` for Traefik routing and n8n host config
+- `SSL_EMAIL` / `ACME_EMAIL`: For Let's Encrypt certificate registration
+- `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`: Database credentials (defaults to `n8n` in docker-compose.yml)
+- `GENERIC_TIMEZONE`: Timezone for n8n
+- `N8N_RUNNERS_ENABLED`: Task runners (defaults to `true`)
+
+## Known Issues / Gotchas
+
+- **Backup/restore mismatch**: `backup.sh` saves files into timestamped folders (`backups/YYYYMMDD_HHMMSS/postgres.sql`), but `restore.sh` expects flat files with date suffixes (`backups/postgres_YYYYMMDD_HHMMSS.sql`). The restore script needs updating to match the backup format, or use the manual restore steps from `backup_info.txt`.
+- **Backup service restart policy**: Set to `restart: "no"`, so it won't restart if it crashes. Check `docker compose ps` to verify it's running.
+- **n8n log level**: Set to `debug` in production — consider changing to `warn` or `error` for less noise.
+- **NODE_OPTIONS**: `--max-old-space-size=3072` (3GB) is set for n8n's Node.js process.
 
 ## Volume Mounts
 
-- `n8n_data`: Persistent n8n workflow and configuration data
-- `postgres_data`: PostgreSQL database files
-- `traefik_data`: SSL certificates (Let's Encrypt acme.json)
-- `./local-files:/files`: Host directory mounted for file operations in n8n
-- `./backups:/backups`: Backup storage directory
+- `n8n_data` → `/home/node/.n8n`: Persistent n8n data
+- `postgres_data` → `/var/lib/postgresql/data`: Database files
+- `traefik_data` → `/letsencrypt`: SSL certificates (acme.json)
+- `./local-files` → `/files`: Host directory for n8n workflow file operations
+- `./backups` → `/backups`: Backup storage
 
-## Security Considerations
+## SSL/TLS
 
-- Basic authentication enabled by default
-- Non-root container execution
-- Read-only Docker socket access for Traefik
-- SSL/TLS encryption for all external traffic
-- Environment-based secret management
+- `scripts/deploy.sh` auto-generates self-signed certs for localhost development
+- Production uses Let's Encrypt via Traefik's TLS challenge resolver
+- Traefik dynamic TLS config in `config/dynamic/tls.yml`
 
-## Troubleshooting Commands
+## Host Configuration (Local Dev)
 
-When issues occur, always check:
-
-1. **Service Status**: `docker compose ps`
-2. **Logs**: `docker compose logs [service_name]`
-3. **Connectivity**: `curl -k https://localhost` or `https://n8n.localhost`
-4. **Port Conflicts**: `sudo netstat -tulpn | grep :8080`
-5. **Certificate Issues**: Check `config/dynamic/` directory
-
-## Development Workflow
-
-When modifying the setup:
-
-1. Test changes in development environment first
-2. Backup existing configuration: `./scripts/backup.sh`
-3. Apply changes to docker-compose.yml or scripts
-4. Redeploy: `docker compose down && docker compose up -d`
-5. Verify functionality: `./scripts/health-check.sh`
-
-## Host Configuration
-
-For local development, add to `/etc/hosts`:
+Add to `/etc/hosts`:
 ```
 127.0.0.1 n8n.localhost traefik.localhost
 ```
-
-For production deployment, ensure DNS points to server IP:
-- n8n.yourdomain.com → server_ip
-- traefik.yourdomain.com → server_ip (optional)

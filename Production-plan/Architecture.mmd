@@ -1,0 +1,8 @@
+flowchart TB
+  User -->|HTTPS| ALB
+  ALB --> ECS[N8N ECS Fargate]
+  ECS --> RDS[(RDS PostgreSQL)]
+  ECS --> EFS[(EFS /home/node/.n8n)]
+  ECS --> SSM[SSM SecureString]
+  Backup[Scheduled Backup Task] --> S3[(S3 Backups)]
+  Route53 --> ALB

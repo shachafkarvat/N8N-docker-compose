@@ -37,7 +37,10 @@ services:
       retries: 10
 
   n8n:
-    image: docker.n8n.io/n8nio/n8n:stable
+    build:
+      context: .
+      dockerfile: n8n.Dockerfile
+    image: n8n-custom:stable
     restart: always
     deploy:
       resources:
@@ -77,8 +80,9 @@ services:
       - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD:-n8n}
       - N8N_RUNNERS_ENABLED=${N8N_RUNNERS_ENABLED:-true}
       - NODE_OPTIONS=--max-old-space-size=3072
+      - NODE_FUNCTION_ALLOW_EXTERNAL=cheerio
       - N8N_PROXY_HOPS=1
-      - N8N_LOG_LEVEL=debug
+      - N8N_LOG_LEVEL=info
       - N8N_LOG_OUTPUT=console      
     volumes:
       - n8n_data:/home/node/.n8n

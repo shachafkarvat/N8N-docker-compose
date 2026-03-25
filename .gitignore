@@ -103,4 +103,3 @@ backup_*.sql
 *_backup.sql
 
 creds.json
-Production-plan/

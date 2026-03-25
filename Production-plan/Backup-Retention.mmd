@@ -1,0 +1,7 @@
+flowchart LR
+  Daily[Daily 03:00] --> Retain7[Retain 7 days]
+  Weekly[Sunday] --> Retain4[Retain 4 weeks]
+  Monthly[Last Sunday] --> Retain12[Retain 12 months]
+  Retain7 --> S3[(S3)]
+  Retain4 --> S3
+  Retain12 --> S3
