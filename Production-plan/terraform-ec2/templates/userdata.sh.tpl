@@ -1,48 +1,74 @@
 #!/bin/bash
-# n8n bootstrap script — Amazon Linux 2023 ARM64 (Graviton)
+# n8n bootstrap — Amazon Linux 2023 ARM64 (Graviton)
 # Runs once on first boot via EC2 user data.
 #
-# Terraform templatefile() variables substituted before execution:
-#   $${aws_region}           AWS region (e.g. eu-west-2)
-#   $${fqdn}                 Full hostname (e.g. n8n.taurak.co.uk)
-#   $${ssl_email}            Let's Encrypt contact email
-#   $${timezone}             Timezone string (e.g. Europe/London)
-#   $${backup_bucket}        S3 bucket for backups
-#   $${db_password_param}    SSM parameter path for DB password
-#   $${encryption_key_param} SSM parameter path for n8n encryption key
-#   $${cloudwatch_log_group} CloudWatch log group name
+# Architecture:
+#   ALB (TLS termination) → EC2:5678 (n8n) → localhost postgres
+#   All persistent data on EFS (survives instance replacement)
+#   Secrets from SSM (never written to disk in plaintext)
+#   Custom n8n image from ECR (includes cheerio)
 
 set -euo pipefail
-
-# Send all output to syslog AND a log file for CloudWatch ingestion
 exec > >(tee /var/log/n8n-init.log | logger -t n8n-init) 2>&1
 
 echo "=== n8n bootstrap started at $(date) ==="
 
-# ── 1. System updates and packages ────────────────────────────────────────
+# ── 1. System packages ────────────────────────────────────────────────────
 dnf update -y
-dnf install -y docker amazon-cloudwatch-agent cronie
+dnf install -y docker amazon-cloudwatch-agent amazon-efs-utils cronie jq
 
 systemctl enable --now docker crond
-
-# Allow ec2-user to run docker without sudo (takes effect on next login)
 usermod -aG docker ec2-user
 
-# ── 2. Docker Compose v2 plugin (ARM64 binary) ────────────────────────────
-COMPOSE_VER="v2.27.0"
+# ── 2. Docker Compose v2 plugin (ARM64) ───────────────────────────────────
+COMPOSE_VER="v2.29.0"
 COMPOSE_DIR="/usr/local/lib/docker/cli-plugins"
 mkdir -p "$COMPOSE_DIR"
-
 curl -fsSL \
   "https://github.com/docker/compose/releases/download/$COMPOSE_VER/docker-compose-linux-aarch64" \
   -o "$COMPOSE_DIR/docker-compose"
 chmod +x "$COMPOSE_DIR/docker-compose"
-
 docker compose version
 echo "Docker Compose installed"
 
-# ── 3. Fetch secrets from SSM ─────────────────────────────────────────────
-# Retry up to 5 times to handle IAM role propagation delays at cold start.
+# ── 3. Mount EFS ──────────────────────────────────────────────────────────
+# Three mount points via EFS access points:
+#   /mnt/efs/n8n-data       → n8n application data (/home/node/.n8n)
+#   /mnt/efs/local-files    → workflow file I/O (/files)
+#   /mnt/efs/postgres-data  → PostgreSQL data directory
+
+mkdir -p /mnt/efs/n8n-data /mnt/efs/local-files /mnt/efs/postgres-data
+
+# Add fstab entries (mount on boot, TLS encrypted)
+cat >> /etc/fstab << FSTABEOF
+${efs_id}:/ /mnt/efs/n8n-data efs _netdev,tls,accesspoint=${efs_ap_n8n_data} 0 0
+${efs_id}:/ /mnt/efs/local-files efs _netdev,tls,accesspoint=${efs_ap_local_files} 0 0
+${efs_id}:/ /mnt/efs/postgres-data efs _netdev,tls,accesspoint=${efs_ap_postgres} 0 0
+FSTABEOF
+
+# Mount all EFS volumes (retry for mount target propagation)
+for mp in /mnt/efs/n8n-data /mnt/efs/local-files /mnt/efs/postgres-data; do
+  for attempt in 1 2 3 4 5; do
+    if mount "$mp" 2>/dev/null; then
+      echo "Mounted $mp"
+      break
+    fi
+    echo "Mount attempt $attempt for $mp failed, retrying in 15s..."
+    sleep 15
+  done
+done
+
+echo "EFS mounted"
+
+# ── 4. Authenticate Docker to ECR ─────────────────────────────────────────
+aws ecr get-login-password --region ${aws_region} | \
+  docker login --username AWS --password-stdin \
+  $(echo "${ecr_repo_url}" | cut -d/ -f1)
+echo "ECR authenticated"
+
+# ── 5. Fetch secrets from SSM (never written to disk) ─────────────────────
+# Secrets are passed to Docker Compose via environment variables only.
+# They exist in memory (the running shell + Docker env), never in a file.
 fetch_ssm() {
   local param="$1"
   local attempt value
@@ -59,111 +85,62 @@ fetch_ssm() {
     echo "SSM fetch attempt $attempt failed for $param, retrying in 15s..." >&2
     sleep 15
   done
-  echo "ERROR: failed to fetch SSM parameter $param after 5 attempts" >&2
+  echo "ERROR: failed to fetch SSM parameter $param" >&2
   return 1
 }
 
 DB_PASS=$(fetch_ssm "${db_password_param}")
 ENC_KEY=$(fetch_ssm "${encryption_key_param}")
-echo "SSM parameters fetched successfully"
+echo "SSM parameters fetched"
 
-# ── 4. Application directory structure ───────────────────────────────────
-mkdir -p /opt/n8n/{letsencrypt,local-files,backups}
+# ── 6. Application directory ──────────────────────────────────────────────
+mkdir -p /opt/n8n
 
-# Traefik requires acme.json to be owned by root with mode 600
-touch /opt/n8n/letsencrypt/acme.json
-chmod 600 /opt/n8n/letsencrypt/acme.json
-
-# ── 5. Environment file ───────────────────────────────────────────────────
-# Unquoted heredoc: bash expands $DB_PASS and $ENC_KEY at write time.
-# Docker Compose reads this file for variable substitution.
-# chmod 600 keeps secrets off of world-readable permissions.
-cat > /opt/n8n/.env << ENVEOF
-# PostgreSQL credentials (used by both the postgres container and n8n)
-POSTGRES_DB=n8n
-POSTGRES_USER=n8n_user
-POSTGRES_PASSWORD=$DB_PASS
-
-# n8n application settings
-N8N_ENCRYPTION_KEY=$ENC_KEY
-N8N_HOST=${fqdn}
-N8N_PROTOCOL=https
-WEBHOOK_URL=https://${fqdn}
-# N8N_PROXY_HOPS=0 because Traefik terminates TLS on the same host (no ALB hop)
-N8N_PROXY_HOPS=0
-GENERIC_TIMEZONE=${timezone}
-TZ=${timezone}
-N8N_RUNNERS_ENABLED=true
-N8N_LOG_LEVEL=info
-N8N_LOG_OUTPUT=console
-# Cap Node.js heap to 3 GB; leaves ~1 GB headroom on a 4 GB instance
-NODE_OPTIONS=--max-old-space-size=3072
-
-# PostgreSQL connection for n8n
-DB_TYPE=postgresdb
-DB_POSTGRESDB_HOST=postgres
-DB_POSTGRESDB_PORT=5432
-DB_POSTGRESDB_DATABASE=n8n
-DB_POSTGRESDB_USER=n8n_user
-DB_POSTGRESDB_PASSWORD=$DB_PASS
-ENVEOF
-chmod 600 /opt/n8n/.env
-echo "Environment file written"
-
-# ── 6. Docker Compose file ────────────────────────────────────────────────
-# Quoted heredoc: bash does NOT expand variables.
-# Terraform has already substituted: ${fqdn}, ${ssl_email}, ${timezone}.
-# $${POSTGRES_PASSWORD} in the template renders as ${POSTGRES_PASSWORD} here;
-# Docker Compose then substitutes it from .env at startup time.
-# Traefik Host() uses double-quote syntax (supported since v2.4) to avoid
-# backtick interpretation issues in shell heredocs.
+# ── 7. Docker Compose file ────────────────────────────────────────────────
+# n8n listens on 5678 — ALB forwards to this port.
+# No Traefik — TLS is terminated by the ALB with an ACM certificate.
+# Postgres runs alongside n8n on localhost — data on EFS.
 cat > /opt/n8n/docker-compose.yml << 'COMPOSEEOF'
 name: n8n
 
 services:
-  traefik:
-    image: traefik:v3.0
-    restart: unless-stopped
-    command:
-      - --log.level=INFO
-      - --api=false
-      - --providers.docker=true
-      - --providers.docker.exposedbydefault=false
-      - --entrypoints.web.address=:80
-      - --entrypoints.websecure.address=:443
-      - --entrypoints.web.http.redirections.entrypoint.to=websecure
-      - --entrypoints.web.http.redirections.entrypoint.scheme=https
-      - --entrypoints.web.http.redirections.entrypoint.permanent=true
-      - --certificatesresolvers.letsencrypt.acme.email=${ssl_email}
-      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
-      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - /opt/n8n/letsencrypt:/letsencrypt
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks:
-      - n8n_net
-
   n8n:
-    image: docker.n8n.io/n8nio/n8n:stable
+    image: ${ecr_repo_url}:${ecr_image_tag}
     restart: unless-stopped
-    env_file: /opt/n8n/.env
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_HOST=${fqdn}
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=https
+      - WEBHOOK_URL=https://${fqdn}/
+      - NODE_ENV=production
+      - GENERIC_TIMEZONE=${timezone}
+      - TZ=${timezone}
+      - N8N_RUNNERS_ENABLED=true
+      - N8N_LOG_LEVEL=info
+      - N8N_LOG_OUTPUT=console
+      # ALB adds one proxy hop
+      - N8N_PROXY_HOPS=1
+      # Node.js heap — 75% of instance memory (t4g.small = 2 GB → 1536 MB)
+      - NODE_OPTIONS=--max-old-space-size=1536
+      - NODE_FUNCTION_ALLOW_EXTERNAL=cheerio
+      # Database
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=n8n
+      - DB_POSTGRESDB_USER=n8n_user
+      # Secrets injected via Docker Compose env_file or shell env
+      # (set by systemd EnvironmentFile pointing to /run/n8n/secrets.env)
     volumes:
-      - n8n_data:/home/node/.n8n
-      - /opt/n8n/local-files:/files
+      - /mnt/efs/n8n-data:/home/node/.n8n
+      - /mnt/efs/local-files:/files
     networks:
       - n8n_net
     depends_on:
       postgres:
         condition: service_healthy
-    labels:
-      - traefik.enable=true
-      - traefik.http.routers.n8n.rule=Host("${fqdn}")
-      - traefik.http.routers.n8n.entrypoints=websecure
-      - traefik.http.routers.n8n.tls.certresolver=letsencrypt
-      - traefik.http.services.n8n.loadbalancer.server.port=5678
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:5678/healthz || exit 1"]
       interval: 30s
@@ -177,10 +154,8 @@ services:
     environment:
       POSTGRES_DB: n8n
       POSTGRES_USER: n8n_user
-      # Docker Compose reads POSTGRES_PASSWORD from .env in the working directory
-      POSTGRES_PASSWORD: $${POSTGRES_PASSWORD}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - /mnt/efs/postgres-data:/var/lib/postgresql/data
     networks:
       - n8n_net
     healthcheck:
@@ -189,9 +164,7 @@ services:
       timeout: 5s
       retries: 5
 
-volumes:
-  n8n_data:
-  postgres_data:
+volumes: {}
 
 networks:
   n8n_net:
@@ -199,19 +172,46 @@ networks:
 COMPOSEEOF
 echo "Docker Compose file written"
 
-# ── 7. Systemd service for auto-start on reboot ───────────────────────────
+# ── 8. Systemd service with secrets injection ─────────────────────────────
+# Secrets are written to a tmpfs file at service start and removed at stop.
+# /run is tmpfs — nothing persists across reboots.
+cat > /etc/systemd/system/n8n-secrets.service << 'SECRETSEOF'
+[Unit]
+Description=Fetch n8n secrets from SSM and write to tmpfs
+Before=n8n.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+ExecStart=/bin/bash -c '\
+  mkdir -p /run/n8n && chmod 700 /run/n8n && \
+  REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region) && \
+  DB_PASS=$(aws ssm get-parameter --region $REGION --name "${db_password_param}" --with-decryption --query Parameter.Value --output text) && \
+  ENC_KEY=$(aws ssm get-parameter --region $REGION --name "${encryption_key_param}" --with-decryption --query Parameter.Value --output text) && \
+  printf "DB_POSTGRESDB_PASSWORD=%s\nN8N_ENCRYPTION_KEY=%s\nPOSTGRES_PASSWORD=%s\n" "$DB_PASS" "$ENC_KEY" "$DB_PASS" > /run/n8n/secrets.env && \
+  chmod 600 /run/n8n/secrets.env'
+
+ExecStop=/bin/rm -f /run/n8n/secrets.env
+
+[Install]
+WantedBy=multi-user.target
+SECRETSEOF
+
 cat > /etc/systemd/system/n8n.service << 'SERVICEEOF'
 [Unit]
 Description=n8n workflow automation (Docker Compose)
-After=docker.service network-online.target
-Requires=docker.service
+After=docker.service network-online.target n8n-secrets.service
+Requires=docker.service n8n-secrets.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/opt/n8n
-ExecStart=/usr/bin/docker compose up -d
+# Load secrets into environment, then pass to docker compose
+EnvironmentFile=/run/n8n/secrets.env
+ExecStart=/bin/bash -c 'export $(cat /run/n8n/secrets.env | xargs) && docker compose up -d'
 ExecStop=/usr/bin/docker compose down
 TimeoutStartSec=300
 
@@ -220,12 +220,10 @@ WantedBy=multi-user.target
 SERVICEEOF
 
 systemctl daemon-reload
-systemctl enable n8n.service
-echo "Systemd service registered"
+systemctl enable n8n-secrets.service n8n.service
+echo "Systemd services registered"
 
-# ── 8. CloudWatch agent configuration ────────────────────────────────────
-# ${cloudwatch_log_group} is substituted by Terraform.
-# {instance_id} is a CloudWatch agent built-in placeholder (no $ prefix).
+# ── 9. CloudWatch agent ───────────────────────────────────────────────────
 cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'CWEOF'
 {
   "logs": {
@@ -252,44 +250,33 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'CWEO
 CWEOF
 
 /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
-  -a fetch-config \
-  -m ec2 \
-  -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json \
-  -s
-echo "CloudWatch agent configured and started"
+  -a fetch-config -m ec2 \
+  -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+echo "CloudWatch agent started"
 
-# ── 9. Backup script ──────────────────────────────────────────────────────
-# Quoted heredoc: bash does not expand variables, so $TIMESTAMP etc. remain
-# as shell variable references in the written script.
-# ${backup_bucket} and ${aws_region} are substituted by Terraform.
+# ── 10. Backup script ─────────────────────────────────────────────────────
 cat > /opt/n8n/backup.sh << 'BACKUPEOF'
 #!/bin/bash
-# n8n backup script — dumps PostgreSQL and archives n8n data volume to S3.
-# Prefixes: daily (7-day retention), weekly/Sunday (28-day), monthly/1st (365-day).
 set -euo pipefail
 
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 BACKUP_DIR=/tmp/n8n-backup-$TIMESTAMP
-BUCKET=${backup_bucket}
+BUCKET="${backup_bucket}"
+REGION="${aws_region}"
 
 echo "=== Backup started: $TIMESTAMP ==="
 mkdir -p "$BACKUP_DIR"
 
-# Dump PostgreSQL (runs inside the running postgres container)
+# pg_dump via the running postgres container
 docker compose -f /opt/n8n/docker-compose.yml exec -T postgres \
   pg_dump -U n8n_user n8n > "$BACKUP_DIR/postgres.sql"
 
-# Archive n8n data volume.
-# Project name is "n8n" (set via `name:` in docker-compose.yml),
-# so Docker names the volume "n8n_n8n_data".
-docker run --rm \
-  -v n8n_n8n_data:/data:ro \
-  -v "$BACKUP_DIR":/backup \
-  alpine tar czf /backup/n8n_data.tar.gz -C /data .
+# Archive n8n data from EFS
+tar czf "$BACKUP_DIR/n8n_data.tar.gz" -C /mnt/efs/n8n-data .
 
-# Determine S3 prefix based on schedule
-DOW=$(date +%u)    # 1=Monday … 7=Sunday
-DOM=$(date +%-d)   # Day of month without leading zero
+# Determine S3 prefix
+DOW=$(date +%u)
+DOM=$(date +%-d)
 if [ "$DOM" = "1" ]; then
   PREFIX=monthly
 elif [ "$DOW" = "7" ]; then
@@ -298,35 +285,68 @@ else
   PREFIX=daily
 fi
 
-# Upload to S3
+# Upload
 aws s3 cp "$BACKUP_DIR/postgres.sql" \
-  "s3://$BUCKET/$PREFIX/$TIMESTAMP/postgres.sql" \
-  --region ${aws_region}
-
+  "s3://$BUCKET/$PREFIX/$TIMESTAMP/postgres.sql" --region "$REGION"
 aws s3 cp "$BACKUP_DIR/n8n_data.tar.gz" \
-  "s3://$BUCKET/$PREFIX/$TIMESTAMP/n8n_data.tar.gz" \
-  --region ${aws_region}
+  "s3://$BUCKET/$PREFIX/$TIMESTAMP/n8n_data.tar.gz" --region "$REGION"
 
-# Remove local temp directory
 rm -rf "$BACKUP_DIR"
-
 echo "=== Backup completed: $PREFIX/$TIMESTAMP ==="
 BACKUPEOF
 chmod +x /opt/n8n/backup.sh
 echo "Backup script written"
 
-# ── 10. Backup cron job (daily at 03:00 UTC) ──────────────────────────────
-echo "0 3 * * * root /opt/n8n/backup.sh >> /var/log/n8n-backup.log 2>&1" \
+# ── 11. Backup cron (02:00 UTC — matches Asgard schedule) ────────────────
+echo "0 2 * * * root /opt/n8n/backup.sh >> /var/log/n8n-backup.log 2>&1" \
   > /etc/cron.d/n8n-backup
 chmod 644 /etc/cron.d/n8n-backup
 echo "Backup cron registered"
 
-# ── 11. Pull images and start the stack ──────────────────────────────────
+# ── 12. n8n image update script ───────────────────────────────────────────
+cat > /opt/n8n/update-n8n.sh << 'UPDATEEOF'
+#!/bin/bash
+# Pull latest custom n8n image from ECR and restart.
+# Usage: sudo /opt/n8n/update-n8n.sh
+set -euo pipefail
+
+REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+ECR_REGISTRY=$(echo "${ecr_repo_url}" | cut -d/ -f1)
+
+echo "Authenticating to ECR..."
+aws ecr get-login-password --region "$REGION" | \
+  docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+echo "Pulling latest image..."
+docker compose -f /opt/n8n/docker-compose.yml pull n8n
+
+echo "Restarting n8n..."
+export $(cat /run/n8n/secrets.env | xargs)
+docker compose -f /opt/n8n/docker-compose.yml up -d n8n
+
+echo "Done. Check: docker compose -f /opt/n8n/docker-compose.yml logs -f n8n"
+UPDATEEOF
+chmod +x /opt/n8n/update-n8n.sh
+echo "Update script written"
+
+# ── 13. Pull images and start ─────────────────────────────────────────────
 cd /opt/n8n
+
+# Export secrets for initial docker compose up
+export DB_POSTGRESDB_PASSWORD="$DB_PASS"
+export N8N_ENCRYPTION_KEY="$ENC_KEY"
+export POSTGRES_PASSWORD="$DB_PASS"
+
 docker compose pull
 docker compose up -d
 
+# Write secrets to tmpfs for systemd (same as n8n-secrets.service does on reboot)
+mkdir -p /run/n8n && chmod 700 /run/n8n
+printf "DB_POSTGRESDB_PASSWORD=%s\nN8N_ENCRYPTION_KEY=%s\nPOSTGRES_PASSWORD=%s\n" \
+  "$DB_PASS" "$ENC_KEY" "$DB_PASS" > /run/n8n/secrets.env
+chmod 600 /run/n8n/secrets.env
+
 echo "=== n8n bootstrap completed at $(date) ==="
-echo "Stack URL: https://${fqdn}"
-echo "Check status: docker compose -f /opt/n8n/docker-compose.yml ps"
-echo "View logs:    docker compose -f /opt/n8n/docker-compose.yml logs -f n8n"
+echo "URL: https://${fqdn} (once ALB health check passes)"
+echo "Check: docker compose -f /opt/n8n/docker-compose.yml ps"
+echo "Logs:  docker compose -f /opt/n8n/docker-compose.yml logs -f n8n"

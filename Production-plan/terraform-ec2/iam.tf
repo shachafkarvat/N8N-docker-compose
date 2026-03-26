@@ -14,7 +14,7 @@ resource "aws_iam_role" "n8n_ec2" {
   tags               = local.tags
 }
 
-# SSM Session Manager — no SSH key or port 22 required
+# SSM Session Manager — shell access without SSH
 resource "aws_iam_role_policy_attachment" "ssm_managed_core" {
   role       = aws_iam_role.n8n_ec2.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
@@ -22,7 +22,7 @@ resource "aws_iam_role_policy_attachment" "ssm_managed_core" {
 
 resource "aws_iam_policy" "n8n_ec2" {
   name        = "n8n-ec2-policy"
-  description = "Allows n8n EC2 to read SSM secrets, write backups to S3, and push logs to CloudWatch"
+  description = "n8n EC2: read SSM secrets, pull ECR images, write S3 backups, push CloudWatch logs, mount EFS"
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -35,15 +35,31 @@ resource "aws_iam_policy" "n8n_ec2" {
           "ssm:GetParameters"
         ]
         Resource = [
-          aws_ssm_parameter.db_password.arn,
-          aws_ssm_parameter.encryption_key.arn
+          data.aws_ssm_parameter.db_password.arn,
+          data.aws_ssm_parameter.encryption_key.arn
         ]
       },
       {
         Sid      = "DecryptSSMSecrets"
         Effect   = "Allow"
         Action   = ["kms:Decrypt"]
-        Resource = "*" # AWS-managed key (aws/ssm) — no custom key ARN available
+        Resource = "*"
+      },
+      {
+        Sid    = "ECRPull"
+        Effect = "Allow"
+        Action = [
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage",
+          "ecr:BatchCheckLayerAvailability"
+        ]
+        Resource = [aws_ecr_repository.n8n.arn]
+      },
+      {
+        Sid    = "ECRAuth"
+        Effect = "Allow"
+        Action = ["ecr:GetAuthorizationToken"]
+        Resource = "*"
       },
       {
         Sid    = "S3Backups"
@@ -67,6 +83,16 @@ resource "aws_iam_policy" "n8n_ec2" {
           "logs:DescribeLogStreams"
         ]
         Resource = "${aws_cloudwatch_log_group.n8n.arn}:*"
+      },
+      {
+        Sid    = "EFSAccess"
+        Effect = "Allow"
+        Action = [
+          "elasticfilesystem:ClientMount",
+          "elasticfilesystem:ClientWrite",
+          "elasticfilesystem:ClientRootAccess"
+        ]
+        Resource = aws_efs_file_system.n8n.arn
       }
     ]
   })
