@@ -82,11 +82,13 @@ services:
       - NODE_OPTIONS=--max-old-space-size=3072
       - NODE_FUNCTION_ALLOW_EXTERNAL=cheerio
       - N8N_PROXY_HOPS=1
-      - N8N_LOG_LEVEL=info
-      - N8N_LOG_OUTPUT=console      
+      - N8N_LOG_LEVEL=debug
+      - N8N_LOG_OUTPUT=console,file
+      - N8N_LOG_FILE_LOCATION=/logs/n8n.log
     volumes:
       - n8n_data:/home/node/.n8n
       - ./local-files:/files
+      - ./logs:/logs
     depends_on:
       postgres:
         condition: service_healthy
