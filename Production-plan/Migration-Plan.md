@@ -59,7 +59,7 @@ cd Production-plan
 ```
 
 The script creates:
-- S3 bucket: `n8n-taurak-state` (versioning + AES-256 encryption)
+- S3 bucket: `n8n-taurak-tfstate` (versioning + AES-256 encryption)
 - DynamoDB table: `n8n-taurak-state-lock`
 
 ### 2b. Populate SSM SecureString parameters
@@ -77,7 +77,7 @@ aws ssm put-parameter \
 
 # n8n encryption key — use the value from your local .env (N8N_ENCRYPTION_KEY)
 aws ssm put-parameter \
-  --name "/n8n/encryption_key" \
+  --name "/n8n/encryption-key" \
   --value "<your-existing-N8N_ENCRYPTION_KEY>" \
   --type SecureString \
   --overwrite \
@@ -122,43 +122,135 @@ terraform apply
 
 ### EC2 path
 
-The EC2 instance will have a fresh PostgreSQL container started by userdata. Restore to it:
+The EC2 instance runs PostgreSQL and n8n via Docker Compose, with all persistent data on EFS.
+The local stack uses the `postgres` superuser — the EC2 template is aligned to use the same role.
+Credentials are encrypted in PostgreSQL with `N8N_ENCRYPTION_KEY` (stored in SSM) — as long as the key matches the local install, credentials will decrypt correctly after restore.
+
+#### Prerequisites
+
+- AWS CLI v2 configured with appropriate permissions
+- `session-manager-plugin` installed locally (`aws ssm start-session` requires it)
+- A fresh backup from the local stack (Phase 1)
+
+#### Step 1 — Take a fresh backup from the local stack
 
 ```bash
-# 1. Start an SSM session on the instance
+cd /DATA/Work/Projects/N8N/compose
+
+# Dump PostgreSQL (local DB user is 'postgres', database is 'n8n')
+docker compose exec -T postgres pg_dump -U postgres -d n8n \
+  > backups/pre_migration_$(date +%Y%m%d_%H%M%S).sql
+
+# Archive n8n application data (encryption key config, custom nodes, etc.)
+tar czf backups/n8n_data_$(date +%Y%m%d_%H%M%S).tar.gz \
+  -C $(docker volume inspect compose_n8n_data -f '{{.Mountpoint}}') .
+
+# Archive local-files (workflow file I/O directory)
+tar czf backups/local_files_$(date +%Y%m%d_%H%M%S).tar.gz -C local-files .
+```
+
+#### Step 2 — Upload backup artifacts to S3
+
+```bash
+# Upload all three artifacts
+aws s3 cp backups/pre_migration_*.sql \
+  s3://n8n-taurak-backups/restore/postgres.sql --region eu-west-2
+
+aws s3 cp backups/n8n_data_*.tar.gz \
+  s3://n8n-taurak-backups/restore/n8n_data.tar.gz --region eu-west-2
+
+aws s3 cp backups/local_files_*.tar.gz \
+  s3://n8n-taurak-backups/restore/local_files.tar.gz --region eu-west-2
+```
+
+#### Step 3 — Connect to the EC2 instance via SSM
+
+```bash
 INSTANCE_ID=$(aws ec2 describe-instances \
-  --filters "Name=tag:Name,Values=n8n-instance" \
+  --filters "Name=tag:Name,Values=n8n-instance" "Name=instance-state-name,Values=running" \
   --query "Reservations[0].Instances[0].InstanceId" \
   --output text --region eu-west-2)
 
 aws ssm start-session --target "$INSTANCE_ID" --region eu-west-2
+```
 
-# 2. Inside the session: stop n8n (leave postgres running)
-docker compose -f /opt/n8n/docker-compose.yml stop n8n
+#### Step 4 — Stop n8n and edge (leave postgres running)
 
-# 3. Copy your backup SQL to the instance via S3
-aws s3 cp backups/<timestamp>/postgres.sql s3://n8n-taurak-backups/restore/postgres.sql
+```bash
+# Load secrets into shell env (required for docker compose commands)
+set -a && source /run/n8n/secrets.env && set +a
 
-# 4. On the instance: download and restore
-aws s3 cp s3://n8n-taurak-backups/restore/postgres.sql /tmp/postgres.sql --region eu-west-2
+docker compose -f /opt/n8n/docker-compose.yml stop n8n edge
+```
+
+#### Step 5 — Download backup from S3
+
+```bash
+mkdir -p /tmp/restore
+aws s3 cp s3://n8n-taurak-backups/restore/postgres.sql /tmp/restore/ --region eu-west-2
+aws s3 cp s3://n8n-taurak-backups/restore/n8n_data.tar.gz /tmp/restore/ --region eu-west-2
+aws s3 cp s3://n8n-taurak-backups/restore/local_files.tar.gz /tmp/restore/ --region eu-west-2
+```
+
+#### Step 6 — Restore PostgreSQL
+
+```bash
+# Drop and recreate the public schema to start clean
 docker compose -f /opt/n8n/docker-compose.yml exec -T postgres \
-  psql -U n8n_user -d n8n < /tmp/postgres.sql
+  psql -U postgres -d n8n -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
 
-# 5. Restore n8n data volume (workflows, config)
-aws s3 cp backups/<timestamp>/n8n_data.tar.gz s3://n8n-taurak-backups/restore/n8n_data.tar.gz
+# Restore the dump
+docker compose -f /opt/n8n/docker-compose.yml exec -T postgres \
+  psql -U postgres -d n8n < /tmp/restore/postgres.sql
 
-# On the instance:
-aws s3 cp s3://n8n-taurak-backups/restore/n8n_data.tar.gz /tmp/n8n_data.tar.gz --region eu-west-2
-docker run --rm \
-  -v n8n_n8n_data:/data \
-  -v /tmp:/restore \
-  alpine sh -c "cd /data && tar xzf /restore/n8n_data.tar.gz"
+# Verify tables exist
+docker compose -f /opt/n8n/docker-compose.yml exec -T postgres \
+  psql -U postgres -d n8n -c "\dt"
+```
 
-# 6. Restart n8n
-docker compose -f /opt/n8n/docker-compose.yml start n8n
+#### Step 7 — Restore n8n application data to EFS
+
+```bash
+# The n8n-data EFS mount is at /mnt/efs/n8n-data (maps to /home/node/.n8n)
+# Clear existing data and extract backup
+rm -rf /mnt/efs/n8n-data/*
+tar xzf /tmp/restore/n8n_data.tar.gz -C /mnt/efs/n8n-data/
+
+# Fix ownership (EFS access point enforces UID 1000, but verify)
+chown -R 1000:1000 /mnt/efs/n8n-data/
+```
+
+#### Step 8 — Restore local-files to EFS
+
+```bash
+# The local-files EFS mount is at /mnt/efs/local-files (maps to /files)
+rm -rf /mnt/efs/local-files/*
+tar xzf /tmp/restore/local_files.tar.gz -C /mnt/efs/local-files/
+chown -R 1000:1000 /mnt/efs/local-files/
+```
+
+#### Step 9 — Restart the stack
+
+```bash
+docker compose -f /opt/n8n/docker-compose.yml up -d
+
+# Wait for healthy
+docker compose -f /opt/n8n/docker-compose.yml ps
+
+# Check n8n logs
+docker compose -f /opt/n8n/docker-compose.yml logs -f n8n
+```
+
+#### Step 10 — Clean up
+
+```bash
+rm -rf /tmp/restore
 ```
 
 ### ECS path
+
+> **Note**: The ECS path uses RDS (managed PostgreSQL) instead of a container.
+> The DB user for RDS is also `postgres` to match the local dump.
 
 ```bash
 # 1. Upload backup to S3
@@ -169,7 +261,7 @@ aws s3 cp backups/<timestamp>/n8n_data.tar.gz s3://n8n-taurak-backups/restore/n8
 #    Run from a machine with network access to the RDS endpoint (or a bastion)
 RDS_HOST=$(terraform -chdir=Production-plan/terraform-ecs output -raw rds_endpoint | cut -d: -f1)
 aws s3 cp s3://n8n-taurak-backups/restore/postgres.sql /tmp/postgres.sql
-psql -h "$RDS_HOST" -U n8n_user -d n8n < /tmp/postgres.sql
+psql -h "$RDS_HOST" -U postgres -d n8n < /tmp/postgres.sql
 
 # 3. Copy n8n data to EFS
 #    Spin up a temporary EC2 (or Fargate task) that mounts the EFS access point

@@ -7,17 +7,19 @@
 # Cost: ~£16/month (fixed) + ~£0.60/LCU-hour (minimal for n8n traffic)
 
 resource "aws_lb" "n8n" {
+  count              = var.enable_alb ? 1 : 0
   name               = "n8n-alb"
   internal           = false
   load_balancer_type = "application"
-  security_groups    = [aws_security_group.alb_sg.id]
-  subnets            = var.public_subnet_ids
+  security_groups    = [aws_security_group.alb_sg[0].id]
+  subnets            = local.effective_public_subnet_ids
   idle_timeout       = 3600 # n8n webhooks hold connections open
 
   tags = local.tags
 }
 
 resource "aws_lb_target_group" "n8n" {
+  count       = var.enable_alb ? 1 : 0
   name        = "n8n-tg"
   port        = 5678
   protocol    = "HTTP"
@@ -39,14 +41,16 @@ resource "aws_lb_target_group" "n8n" {
 }
 
 resource "aws_lb_target_group_attachment" "n8n" {
-  target_group_arn = aws_lb_target_group.n8n.arn
+  count            = var.enable_alb ? 1 : 0
+  target_group_arn = aws_lb_target_group.n8n[0].arn
   target_id        = aws_instance.n8n.id
   port             = 5678
 }
 
 # Redirect HTTP → HTTPS
 resource "aws_lb_listener" "http" {
-  load_balancer_arn = aws_lb.n8n.arn
+  count             = var.enable_alb ? 1 : 0
+  load_balancer_arn = aws_lb.n8n[0].arn
   port              = 80
   protocol          = "HTTP"
 
@@ -62,7 +66,8 @@ resource "aws_lb_listener" "http" {
 
 # HTTPS listener
 resource "aws_lb_listener" "https" {
-  load_balancer_arn = aws_lb.n8n.arn
+  count             = var.enable_alb ? 1 : 0
+  load_balancer_arn = aws_lb.n8n[0].arn
   port              = 443
   protocol          = "HTTPS"
   ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
@@ -70,6 +75,6 @@ resource "aws_lb_listener" "https" {
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.n8n.arn
+    target_group_arn = aws_lb_target_group.n8n[0].arn
   }
 }

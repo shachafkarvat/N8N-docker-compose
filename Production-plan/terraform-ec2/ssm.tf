@@ -5,7 +5,7 @@
 #   aws ssm put-parameter --name /n8n/db_password \
 #     --value "your-strong-password" --type SecureString --region eu-west-2
 #
-#   aws ssm put-parameter --name /n8n/encryption_key \
+#   aws ssm put-parameter --name /n8n/encryption-key \
 #     --value "your-existing-key" --type SecureString --region eu-west-2
 #
 # Terraform reads them as data sources — does NOT create or manage values.

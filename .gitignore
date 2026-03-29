@@ -106,3 +106,7 @@ creds.json
 Production-plan/n8n-terraform-ec2-fixes
 CLAUDE.md
 Production-plan/archive
+
+# Terraform working directories and provider binaries
+**/.terraform/
+*.deb

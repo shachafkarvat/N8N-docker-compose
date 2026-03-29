@@ -1,14 +1,44 @@
-# n8n Self-Hosted Docker Setup with Automated Backup
+# n8n Self-Hosted Platform
 
-A production-ready Docker Compose setup for n8n workflow automation with PostgreSQL database, Traefik reverse proxy, SSL termination, and automated daily backups.
+This repository now contains two deployment paths for n8n:
 
-## Architecture Overview
+- local and single-host Docker Compose with Traefik, PostgreSQL, and automated backups
+- AWS production deployment assets under `Production-plan/terraform-ec2` for EC2, EFS, ECR, S3, Route53, and ACM
+
+The root-level Docker Compose stack is still the local/self-hosted path. The AWS production path is documented separately in `Production-plan/terraform-ec2/README.md`.
+
+Recent infrastructure changes are summarized in `CHANGES.md`.
+
+## Repository Layout
+
+### Local Docker Compose stack
+
+The root directory contains the local/self-hosted deployment files:
+- `docker-compose.yml`
+- `n8n.Dockerfile`
+- backup and restore scripts
+- local configuration and data folders
 
 This stack includes:
 - **n8n**: Workflow automation platform
 - **PostgreSQL**: Database for n8n data storage
 - **Traefik**: Reverse proxy with automatic SSL certificate management
 - **Backup Service**: Automated daily backups with retention management
+
+### AWS production assets
+
+The `Production-plan` directory contains architecture, migration, and infrastructure work for AWS deployment.
+
+The main EC2 deployment module is:
+- `Production-plan/terraform-ec2`
+
+That module supports:
+- direct instance mode with Elastic IP and ACM certificate termination inside Docker
+- optional ALB mode with ACM certificate termination on the load balancer
+- Spot instances with persistent request support
+- EFS-backed persistent application and PostgreSQL data
+- ECR-hosted custom n8n image
+- S3-backed backups and runtime config artifacts
 
 ## Prerequisites
 
@@ -32,7 +62,7 @@ df -h
 sudo netstat -tulpn | grep -E ':80|:443|:8080'
 ```
 
-## Architecture Overview
+## Local Architecture Overview
 
 ### System Components
 ```
@@ -62,7 +92,7 @@ sudo netstat -tulpn | grep -E ':80|:443|:8080'
 - **PostgreSQL**: Primary database for workflow data and custom applications
 - **Docker Network**: Isolated internal communication with external HTTPS access
 
-## Quick Start Guide
+## Local Quick Start Guide
 
 ### 1. Clone and Setup
 ```bash
@@ -104,6 +134,20 @@ docker compose logs -f
 - **n8n Interface**: `https://n8n.taurak.co.uk`
 - **Traefik Dashboard**: `http://localhost:8081`
 - **Default Login**: Username from `N8N_BASIC_AUTH_USER`, Password from `N8N_BASIC_AUTH_PASSWORD`
+
+## AWS Production Deployment
+
+For the AWS deployment path, use the dedicated module documentation:
+
+- `Production-plan/terraform-ec2/README.md`
+
+That documentation covers:
+- prerequisites and Terraform bootstrap
+- VPC and subnet handling
+- direct edge mode versus ALB mode
+- ACM certificate behavior
+- Spot instance configuration
+- runtime config refresh and operational commands
 
 ## Service Architecture
 
