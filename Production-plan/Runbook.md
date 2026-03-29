@@ -16,7 +16,7 @@ aws ssm put-parameter \
   --type SecureString --overwrite --region eu-west-2
 
 aws ssm put-parameter \
-  --name "/n8n/encryption_key" \
+  --name "/n8n/encryption-key" \
   --value "<your-N8N_ENCRYPTION_KEY>" \
   --type SecureString --overwrite --region eu-west-2
 
@@ -61,6 +61,13 @@ docker compose -f /opt/n8n/docker-compose.yml logs -f n8n
 docker compose -f /opt/n8n/docker-compose.yml restart n8n
 ```
 
+### Refresh docker-compose config from S3
+
+```bash
+sudo /opt/n8n/refresh-config.sh
+sudo systemctl restart n8n
+```
+
 ### Restart full stack
 
 ```bash
@@ -97,24 +104,26 @@ aws logs tail /ec2/n8n --follow --region eu-west-2
 
 ### Rotate secrets (EC2)
 
+The EC2 stack does **not** use a `.env` file. Secrets live in SSM and are injected
+via the `n8n-secrets.service` systemd unit into `/run/n8n/secrets.env` (tmpfs).
+
 ```bash
-# 1. Update SSM parameter
+# 1. Update the SSM parameter
 aws ssm put-parameter \
   --name "/n8n/db_password" \
   --value "<new-password>" \
   --type SecureString --overwrite --region eu-west-2
 
-# 2. Re-write .env from SSM (re-run the relevant parts of userdata, or manually)
-DB_PASS=$(aws ssm get-parameter --name /n8n/db_password \
-  --with-decryption --query Parameter.Value --output text --region eu-west-2)
+# 2. On the EC2 instance (via SSM session):
+#    Re-fetch secrets by restarting the secrets service, then recreate containers
+sudo systemctl restart n8n-secrets.service
 
-# Update .env
-sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$DB_PASS/" /opt/n8n/.env
-sed -i "s/^DB_POSTGRESDB_PASSWORD=.*/DB_POSTGRESDB_PASSWORD=$DB_PASS/" /opt/n8n/.env
-chmod 600 /opt/n8n/.env
-
-# 3. Recreate containers to pick up new env
+set -a && source /run/n8n/secrets.env && set +a
 docker compose -f /opt/n8n/docker-compose.yml up -d --force-recreate
+
+# 3. Also update the postgres role password inside the running container
+docker compose -f /opt/n8n/docker-compose.yml exec -T postgres \
+  psql -U postgres -c "ALTER USER postgres PASSWORD '<new-password>';"
 ```
 
 ### Validate health
@@ -123,6 +132,168 @@ docker compose -f /opt/n8n/docker-compose.yml up -d --force-recreate
 curl -I https://n8n.taurak.co.uk/healthz     # expect HTTP 200
 curl -I http://n8n.taurak.co.uk              # expect HTTP 301 redirect to HTTPS
 ```
+
+---
+
+## Restore Local Backup to EC2
+
+This procedure migrates data from the local Docker Compose stack to the EC2 instance.
+
+### How secrets flow on EC2
+
+The EC2 stack has no `.env` file. Secrets follow this path:
+
+```
+SSM Parameter Store (/n8n/db_password, /n8n/encryption-key)
+  ↓  aws ssm get-parameter --with-decryption
+/run/n8n/secrets.env  (tmpfs — RAM only, never on disk)
+  ↓  systemd EnvironmentFile= directive
+Shell environment variables
+  ↓  ${VAR} interpolation in docker-compose.yml
+Container environment
+```
+
+Non-secret values (`DB_POSTGRESDB_USER=postgres`, `DB_POSTGRESDB_DATABASE=n8n`, etc.) are
+hardcoded in the Compose template stored on S3.
+
+### Architecture mapping
+
+| Component | Local | EC2 |
+|---|---|---|
+| DB user | `postgres` | `postgres` |
+| DB name | `n8n` | `n8n` |
+| DB password source | `.env` file | SSM `/n8n/db_password` |
+| Encryption key source | `~/.n8n/config` | SSM `/n8n/encryption-key` |
+| n8n data | Docker volume `n8n_data` | EFS `/mnt/efs/n8n-data` |
+| local-files | `./local-files` bind mount | EFS `/mnt/efs/local-files` |
+| Postgres data | Docker volume `postgres_data` | EFS `/mnt/efs/postgres-data` |
+| Reverse proxy | Traefik + Let's Encrypt | nginx + ACM certificate |
+| n8n image | `n8n-custom:stable` (local build) | ECR `taurak/n8n` |
+
+### Step 1 — Take fresh backup from local
+
+```bash
+cd /DATA/Work/Projects/N8N/compose
+TS=$(date +%Y%m%d_%H%M%S)
+
+# PostgreSQL dump (local DB user is 'postgres')
+docker compose exec -T postgres pg_dump -U postgres -d n8n \
+  > backups/pre_migration_$TS.sql
+
+# n8n application data
+tar czf backups/n8n_data_$TS.tar.gz \
+  -C $(docker volume inspect compose_n8n_data -f '{{.Mountpoint}}') .
+
+# local-files (workflow file I/O)
+tar czf backups/local_files_$TS.tar.gz -C local-files .
+
+echo "Backup: $TS"
+```
+
+### Step 2 — Upload to S3
+
+```bash
+aws s3 cp backups/pre_migration_$TS.sql \
+  s3://n8n-taurak-backups/restore/postgres.sql --region eu-west-2
+
+aws s3 cp backups/n8n_data_$TS.tar.gz \
+  s3://n8n-taurak-backups/restore/n8n_data.tar.gz --region eu-west-2
+
+aws s3 cp backups/local_files_$TS.tar.gz \
+  s3://n8n-taurak-backups/restore/local_files.tar.gz --region eu-west-2
+```
+
+### Step 3 — Connect to EC2
+
+```bash
+INSTANCE_ID=$(aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=n8n-instance" "Name=instance-state-name,Values=running" \
+  --query "Reservations[0].Instances[0].InstanceId" \
+  --output text --region eu-west-2)
+
+aws ssm start-session --target "$INSTANCE_ID" --region eu-west-2
+```
+
+### Step 4 — Stop n8n and edge containers
+
+```bash
+# Load secrets (required for docker compose commands)
+set -a && source /run/n8n/secrets.env && set +a
+
+docker compose -f /opt/n8n/docker-compose.yml stop n8n edge
+```
+
+### Step 5 — Download backup from S3
+
+```bash
+mkdir -p /tmp/restore
+aws s3 cp s3://n8n-taurak-backups/restore/postgres.sql /tmp/restore/ --region eu-west-2
+aws s3 cp s3://n8n-taurak-backups/restore/n8n_data.tar.gz /tmp/restore/ --region eu-west-2
+aws s3 cp s3://n8n-taurak-backups/restore/local_files.tar.gz /tmp/restore/ --region eu-west-2
+```
+
+### Step 6 — Restore PostgreSQL
+
+```bash
+# Drop and recreate schema
+docker compose -f /opt/n8n/docker-compose.yml exec -T postgres \
+  psql -U postgres -d n8n -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+
+# Restore
+docker compose -f /opt/n8n/docker-compose.yml exec -T postgres \
+  psql -U postgres -d n8n < /tmp/restore/postgres.sql
+
+# Verify
+docker compose -f /opt/n8n/docker-compose.yml exec -T postgres \
+  psql -U postgres -d n8n -c "\dt"
+```
+
+### Step 7 — Restore n8n data and local-files to EFS
+
+```bash
+# n8n application data (EFS mount at /mnt/efs/n8n-data → /home/node/.n8n)
+rm -rf /mnt/efs/n8n-data/*
+tar xzf /tmp/restore/n8n_data.tar.gz -C /mnt/efs/n8n-data/
+chown -R 1000:1000 /mnt/efs/n8n-data/
+
+# local-files (EFS mount at /mnt/efs/local-files → /files)
+rm -rf /mnt/efs/local-files/*
+tar xzf /tmp/restore/local_files.tar.gz -C /mnt/efs/local-files/
+chown -R 1000:1000 /mnt/efs/local-files/
+```
+
+### Step 8 — Restart and verify
+
+```bash
+docker compose -f /opt/n8n/docker-compose.yml up -d
+
+# Wait for healthy
+sleep 30
+docker compose -f /opt/n8n/docker-compose.yml ps
+
+# Verify credentials migrated
+docker compose -f /opt/n8n/docker-compose.yml exec -T postgres \
+  psql -U postgres -d n8n -c "SELECT id, name, type FROM credentials_entity;"
+
+# Check n8n logs for errors
+docker compose -f /opt/n8n/docker-compose.yml logs --tail 50 n8n
+```
+
+### Step 9 — Clean up
+
+```bash
+rm -rf /tmp/restore
+aws s3 rm s3://n8n-taurak-backups/restore/ --recursive --region eu-west-2
+```
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `credentials could not be decrypted` | Encryption key mismatch | Verify `/n8n/encryption-key` in SSM matches local `~/.n8n/config` |
+| `FATAL: password authentication failed` | DB password mismatch | Restart `n8n-secrets.service`, then `docker compose up -d --force-recreate` |
+| `permission denied` on EFS files | UID mismatch | `chown -R 1000:1000 /mnt/efs/n8n-data/` |
+| n8n fails to start after restore | Stale PID/lock files in n8n-data | `rm -f /mnt/efs/n8n-data/*.lock` |
 
 ---
 
@@ -259,7 +430,7 @@ docker push "$ECR/n8n-custom:latest"
 
 ## Terraform State
 
-Both codebases share the `n8n-taurak-state` S3 bucket with separate keys:
+Both codebases share the `n8n-taurak-tfstate` S3 bucket with separate keys:
 
 | Codebase | State key |
 |---|---|

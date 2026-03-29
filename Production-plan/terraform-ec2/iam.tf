@@ -22,7 +22,7 @@ resource "aws_iam_role_policy_attachment" "ssm_managed_core" {
 
 resource "aws_iam_policy" "n8n_ec2" {
   name        = "n8n-ec2-policy"
-  description = "n8n EC2: read SSM secrets, pull ECR images, write S3 backups, push CloudWatch logs, mount EFS"
+  description = "n8n EC2: read SSM secrets, pull ECR images, write S3 backups, push CloudWatch logs, mount EFS, export ACM certs"
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -56,9 +56,9 @@ resource "aws_iam_policy" "n8n_ec2" {
         Resource = [aws_ecr_repository.n8n.arn]
       },
       {
-        Sid    = "ECRAuth"
-        Effect = "Allow"
-        Action = ["ecr:GetAuthorizationToken"]
+        Sid      = "ECRAuth"
+        Effect   = "Allow"
+        Action   = ["ecr:GetAuthorizationToken"]
         Resource = "*"
       },
       {
@@ -75,6 +75,19 @@ resource "aws_iam_policy" "n8n_ec2" {
         ]
       },
       {
+        Sid    = "S3ConfigRead"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:GetObjectVersion",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          aws_s3_bucket.config.arn,
+          "${aws_s3_bucket.config.arn}/*"
+        ]
+      },
+      {
         Sid    = "CloudWatchLogs"
         Effect = "Allow"
         Action = [
@@ -83,6 +96,15 @@ resource "aws_iam_policy" "n8n_ec2" {
           "logs:DescribeLogStreams"
         ]
         Resource = "${aws_cloudwatch_log_group.n8n.arn}:*"
+      },
+      {
+        Sid    = "ExportAcmCertificate"
+        Effect = "Allow"
+        Action = [
+          "acm:ExportCertificate",
+          "acm:DescribeCertificate"
+        ]
+        Resource = aws_acm_certificate.n8n.arn
       },
       {
         Sid    = "EFSAccess"

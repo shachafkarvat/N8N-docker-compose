@@ -2,8 +2,8 @@
 set -euo pipefail
 
 AWS_REGION="eu-west-2"
-STATE_BUCKET="n8n_taurak_state"
-LOCK_TABLE="n8n_taurak_state_lock"
+STATE_BUCKET="n8n-taurak-tfstate"
+LOCK_TABLE="n8n-taurak-state-lock"
 
 aws s3api head-bucket --bucket "$STATE_BUCKET" 2>/dev/null || \
   aws s3api create-bucket --bucket "$STATE_BUCKET" --region "$AWS_REGION" \

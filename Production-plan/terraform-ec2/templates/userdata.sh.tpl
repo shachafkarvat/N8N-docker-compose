@@ -3,7 +3,8 @@
 # Runs once on first boot via EC2 user data.
 #
 # Architecture:
-#   ALB (TLS termination) → EC2:5678 (n8n) → localhost postgres
+#   ALB mode:    ALB (TLS termination) → EC2:5678 (n8n) → localhost postgres
+#   Direct mode: Internet → nginx (ACM TLS) → n8n → localhost postgres
 #   All persistent data on EFS (survives instance replacement)
 #   Secrets from SSM (never written to disk in plaintext)
 #   Custom n8n image from ECR (includes cheerio)
@@ -15,9 +16,10 @@ echo "=== n8n bootstrap started at $(date) ==="
 
 # ── 1. System packages ────────────────────────────────────────────────────
 dnf update -y
-dnf install -y docker amazon-cloudwatch-agent amazon-efs-utils cronie jq
+dnf install -y docker amazon-cloudwatch-agent amazon-efs-utils amazon-ssm-agent cronie jq openssl pip
+pip3 install botocore   # EFS mount helper uses botocore to resolve mount-target IPs
 
-systemctl enable --now docker crond
+systemctl enable --now docker crond amazon-ssm-agent
 usermod -aG docker ec2-user
 
 # ── 2. Docker Compose v2 plugin (ARM64) ───────────────────────────────────
@@ -46,16 +48,21 @@ ${efs_id}:/ /mnt/efs/local-files efs _netdev,tls,accesspoint=${efs_ap_local_file
 ${efs_id}:/ /mnt/efs/postgres-data efs _netdev,tls,accesspoint=${efs_ap_postgres} 0 0
 FSTABEOF
 
-# Mount all EFS volumes (retry for mount target propagation)
+# Mount all EFS volumes (retry for mount target propagation / DNS)
 for mp in /mnt/efs/n8n-data /mnt/efs/local-files /mnt/efs/postgres-data; do
-  for attempt in 1 2 3 4 5; do
-    if mount "$mp" 2>/dev/null; then
+  mounted=false
+  for attempt in $(seq 1 10); do
+    if mount "$mp" 2>&1; then
       echo "Mounted $mp"
+      mounted=true
       break
     fi
-    echo "Mount attempt $attempt for $mp failed, retrying in 15s..."
-    sleep 15
+    echo "Mount attempt $attempt for $mp failed, retrying in 30s..."
+    sleep 30
   done
+  if [[ "$mounted" != "true" ]]; then
+    echo "ERROR: Failed to mount $mp after 10 attempts" >&2
+  fi
 done
 
 echo "EFS mounted"
@@ -96,81 +103,123 @@ echo "SSM parameters fetched"
 # ── 6. Application directory ──────────────────────────────────────────────
 mkdir -p /opt/n8n
 
-# ── 7. Docker Compose file ────────────────────────────────────────────────
-# n8n listens on 5678 — ALB forwards to this port.
-# No Traefik — TLS is terminated by the ALB with an ACM certificate.
-# Postgres runs alongside n8n on localhost — data on EFS.
-cat > /opt/n8n/docker-compose.yml << 'COMPOSEEOF'
-name: n8n
+# ── 7. Runtime config sync ────────────────────────────────────────────────
+# The Compose file is stored in S3 so application config can be updated
+# independently of instance bootstrap. Secrets stay in SSM and are injected
+# by systemd at runtime.
+cat > /opt/n8n/refresh-config.sh << 'REFRESHEOF'
+#!/bin/bash
+set -euo pipefail
 
-services:
-  n8n:
-    image: ${ecr_repo_url}:${ecr_image_tag}
-    restart: unless-stopped
-    ports:
-      - "5678:5678"
-    environment:
-      - N8N_HOST=${fqdn}
-      - N8N_PORT=5678
-      - N8N_PROTOCOL=https
-      - WEBHOOK_URL=https://${fqdn}/
-      - NODE_ENV=production
-      - GENERIC_TIMEZONE=${timezone}
-      - TZ=${timezone}
-      - N8N_RUNNERS_ENABLED=true
-      - N8N_LOG_LEVEL=info
-      - N8N_LOG_OUTPUT=console
-      # ALB adds one proxy hop
-      - N8N_PROXY_HOPS=1
-      # Node.js heap — 75% of instance memory (t4g.small = 2 GB → 1536 MB)
-      - NODE_OPTIONS=--max-old-space-size=1536
-      - NODE_FUNCTION_ALLOW_EXTERNAL=cheerio
-      # Database
-      - DB_TYPE=postgresdb
-      - DB_POSTGRESDB_HOST=postgres
-      - DB_POSTGRESDB_PORT=5432
-      - DB_POSTGRESDB_DATABASE=n8n
-      - DB_POSTGRESDB_USER=n8n_user
-      # Secrets injected via Docker Compose env_file or shell env
-      # (set by systemd EnvironmentFile pointing to /run/n8n/secrets.env)
-    volumes:
-      - /mnt/efs/n8n-data:/home/node/.n8n
-      - /mnt/efs/local-files:/files
-    networks:
-      - n8n_net
-    depends_on:
-      postgres:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:5678/healthz || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
+CONFIG_URI="${compose_config_s3_uri}"
+TARGET="/opt/n8n/docker-compose.yml"
+TMP=$(mktemp)
 
-  postgres:
-    image: postgres:16-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: n8n
-      POSTGRES_USER: n8n_user
-    volumes:
-      - /mnt/efs/postgres-data:/var/lib/postgresql/data
-    networks:
-      - n8n_net
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U n8n_user -d n8n"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+aws s3 cp "$CONFIG_URI" "$TMP" --region "${aws_region}" >/dev/null
 
-volumes: {}
+if [[ -f "$TARGET" ]] && cmp -s "$TMP" "$TARGET"; then
+  rm -f "$TMP"
+  echo "Compose config already up to date"
+  exit 0
+fi
 
-networks:
-  n8n_net:
-    driver: bridge
-COMPOSEEOF
-echo "Docker Compose file written"
+install -m 0644 "$TMP" "$TARGET"
+rm -f "$TMP"
+echo "Compose config refreshed from S3"
+REFRESHEOF
+chmod +x /opt/n8n/refresh-config.sh
+
+cat > /opt/n8n/refresh-acm-certificate.sh << 'ACMEOF'
+#!/bin/bash
+set -euo pipefail
+
+if [[ "${enable_alb}" == "true" ]]; then
+  echo "ALB mode enabled; ACM certificate remains attached to the load balancer"
+  exit 0
+fi
+
+TLS_DIR="/run/n8n/tls"
+PASSFILE="$TLS_DIR/passphrase.txt"
+EXPORT_JSON="$TLS_DIR/export.json"
+ENC_KEY="$TLS_DIR/private-key.encrypted.pem"
+KEYFILE="$TLS_DIR/tls.key"
+CERTFILE="$TLS_DIR/tls.crt"
+CHAINFILE="$TLS_DIR/chain.crt"
+FULLCHAINFILE="$TLS_DIR/fullchain.crt"
+
+mkdir -p "$TLS_DIR"
+chmod 700 "$TLS_DIR"
+
+printf '%s' "$(openssl rand -hex 32)" > "$PASSFILE"
+
+aws acm export-certificate \
+  --region "${aws_region}" \
+  --certificate-arn "${acm_certificate_arn}" \
+  --passphrase "fileb://$PASSFILE" \
+  --output json > "$EXPORT_JSON"
+
+jq -r '.Certificate' "$EXPORT_JSON" > "$CERTFILE"
+jq -r '.CertificateChain' "$EXPORT_JSON" > "$CHAINFILE"
+jq -r '.PrivateKey' "$EXPORT_JSON" > "$ENC_KEY"
+openssl pkey -in "$ENC_KEY" -out "$KEYFILE" -passin "file:$PASSFILE" >/dev/null 2>&1
+cat "$CERTFILE" "$CHAINFILE" > "$FULLCHAINFILE"
+
+chmod 600 "$KEYFILE" "$CERTFILE" "$CHAINFILE" "$FULLCHAINFILE"
+rm -f "$PASSFILE" "$EXPORT_JSON" "$ENC_KEY"
+echo "ACM certificate exported to $TLS_DIR"
+ACMEOF
+chmod +x /opt/n8n/refresh-acm-certificate.sh
+
+cat > /opt/n8n/nginx.conf << 'NGINXEOF'
+map $http_upgrade $connection_upgrade {
+  default upgrade;
+  '' close;
+}
+
+server {
+  listen 80;
+  server_name ${fqdn};
+  return 301 https://$host$request_uri;
+}
+
+server {
+  listen 443 ssl http2;
+  server_name ${fqdn};
+
+  ssl_certificate /run/n8n/tls/fullchain.crt;
+  ssl_certificate_key /run/n8n/tls/tls.key;
+  ssl_protocols TLSv1.2 TLSv1.3;
+  ssl_prefer_server_ciphers off;
+
+  client_max_body_size 64m;
+  proxy_read_timeout 3600s;
+  proxy_send_timeout 3600s;
+
+  location / {
+    proxy_pass http://n8n:5678;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+  }
+}
+NGINXEOF
+
+/opt/n8n/refresh-config.sh
+
+# ACM certificate may not be issued yet if DNS validation is still propagating.
+# Retry with backoff so the rest of the bootstrap is not blocked.
+for cert_attempt in $(seq 1 12); do
+  if /opt/n8n/refresh-acm-certificate.sh 2>&1; then
+    break
+  fi
+  echo "ACM cert export attempt $cert_attempt failed, retrying in 30s..."
+  sleep 30
+done
+echo "Docker Compose file downloaded"
 
 # ── 8. Systemd service with secrets injection ─────────────────────────────
 # Secrets are written to a tmpfs file at service start and removed at stop.
@@ -186,10 +235,10 @@ RemainAfterExit=yes
 
 ExecStart=/bin/bash -c '\
   mkdir -p /run/n8n && chmod 700 /run/n8n && \
-  REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region) && \
+  REGION=${aws_region} && \
   DB_PASS=$(aws ssm get-parameter --region $REGION --name "${db_password_param}" --with-decryption --query Parameter.Value --output text) && \
   ENC_KEY=$(aws ssm get-parameter --region $REGION --name "${encryption_key_param}" --with-decryption --query Parameter.Value --output text) && \
-  printf "DB_POSTGRESDB_PASSWORD=%s\nN8N_ENCRYPTION_KEY=%s\nPOSTGRES_PASSWORD=%s\n" "$DB_PASS" "$ENC_KEY" "$DB_PASS" > /run/n8n/secrets.env && \
+  printf "DB_POSTGRESDB_PASSWORD=%%s\nN8N_ENCRYPTION_KEY=%%s\nPOSTGRES_PASSWORD=%%s\n" "$DB_PASS" "$ENC_KEY" "$DB_PASS" > /run/n8n/secrets.env && \
   chmod 600 /run/n8n/secrets.env'
 
 ExecStop=/bin/rm -f /run/n8n/secrets.env
@@ -209,9 +258,9 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/opt/n8n
-# Load secrets into environment, then pass to docker compose
+# Load secrets into environment, refresh Compose config from S3, then start.
 EnvironmentFile=/run/n8n/secrets.env
-ExecStart=/bin/bash -c 'export $(cat /run/n8n/secrets.env | xargs) && docker compose up -d'
+ExecStart=/bin/bash -c '/opt/n8n/refresh-config.sh && /opt/n8n/refresh-acm-certificate.sh && docker compose config >/dev/null && docker compose up -d'
 ExecStop=/usr/bin/docker compose down
 TimeoutStartSec=300
 
@@ -269,7 +318,7 @@ mkdir -p "$BACKUP_DIR"
 
 # pg_dump via the running postgres container
 docker compose -f /opt/n8n/docker-compose.yml exec -T postgres \
-  pg_dump -U n8n_user n8n > "$BACKUP_DIR/postgres.sql"
+  pg_dump -U postgres n8n > "$BACKUP_DIR/postgres.sql"
 
 # Archive n8n data from EFS
 tar czf "$BACKUP_DIR/n8n_data.tar.gz" -C /mnt/efs/n8n-data .
@@ -303,6 +352,12 @@ echo "0 2 * * * root /opt/n8n/backup.sh >> /var/log/n8n-backup.log 2>&1" \
 chmod 644 /etc/cron.d/n8n-backup
 echo "Backup cron registered"
 
+cat > /etc/cron.d/n8n-cert-refresh << 'CERTREFRESHEOF'
+15 3 * * * root if [ "${enable_alb}" = "false" ]; then /opt/n8n/refresh-acm-certificate.sh && docker compose -f /opt/n8n/docker-compose.yml up -d edge >> /var/log/n8n-cert-refresh.log 2>&1; fi
+CERTREFRESHEOF
+chmod 644 /etc/cron.d/n8n-cert-refresh
+echo "Certificate refresh cron registered"
+
 # ── 12. n8n image update script ───────────────────────────────────────────
 cat > /opt/n8n/update-n8n.sh << 'UPDATEEOF'
 #!/bin/bash
@@ -310,8 +365,11 @@ cat > /opt/n8n/update-n8n.sh << 'UPDATEEOF'
 # Usage: sudo /opt/n8n/update-n8n.sh
 set -euo pipefail
 
-REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+REGION="${aws_region}"
 ECR_REGISTRY=$(echo "${ecr_repo_url}" | cut -d/ -f1)
+
+echo "Refreshing Compose config from S3..."
+/opt/n8n/refresh-config.sh
 
 echo "Authenticating to ECR..."
 aws ecr get-login-password --region "$REGION" | \
@@ -321,7 +379,10 @@ echo "Pulling latest image..."
 docker compose -f /opt/n8n/docker-compose.yml pull n8n
 
 echo "Restarting n8n..."
-export $(cat /run/n8n/secrets.env | xargs)
+set -a
+source /run/n8n/secrets.env
+set +a
+docker compose -f /opt/n8n/docker-compose.yml config >/dev/null
 docker compose -f /opt/n8n/docker-compose.yml up -d n8n
 
 echo "Done. Check: docker compose -f /opt/n8n/docker-compose.yml logs -f n8n"
@@ -337,6 +398,7 @@ export DB_POSTGRESDB_PASSWORD="$DB_PASS"
 export N8N_ENCRYPTION_KEY="$ENC_KEY"
 export POSTGRES_PASSWORD="$DB_PASS"
 
+docker compose config >/dev/null
 docker compose pull
 docker compose up -d
 
@@ -347,6 +409,6 @@ printf "DB_POSTGRESDB_PASSWORD=%s\nN8N_ENCRYPTION_KEY=%s\nPOSTGRES_PASSWORD=%s\n
 chmod 600 /run/n8n/secrets.env
 
 echo "=== n8n bootstrap completed at $(date) ==="
-echo "URL: https://${fqdn} (once ALB health check passes)"
+echo "URL: https://${fqdn}"
 echo "Check: docker compose -f /opt/n8n/docker-compose.yml ps"
 echo "Logs:  docker compose -f /opt/n8n/docker-compose.yml logs -f n8n"

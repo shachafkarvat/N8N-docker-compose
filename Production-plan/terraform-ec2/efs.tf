@@ -18,7 +18,7 @@ resource "aws_efs_file_system" "n8n" {
 
 # Mount targets in each subnet the EC2 instance might live in
 resource "aws_efs_mount_target" "n8n" {
-  for_each        = toset(var.public_subnet_ids)
+  for_each        = local.effective_public_subnet_map
   file_system_id  = aws_efs_file_system.n8n.id
   subnet_id       = each.value
   security_groups = [aws_security_group.efs_sg.id]
@@ -71,7 +71,7 @@ resource "aws_efs_access_point" "postgres_data" {
   file_system_id = aws_efs_file_system.n8n.id
 
   posix_user {
-    uid = 999  # postgres user UID in official postgres:16-alpine image
+    uid = 999 # postgres user UID in official postgres:16-alpine image
     gid = 999
   }
 
@@ -87,13 +87,28 @@ resource "aws_efs_access_point" "postgres_data" {
   tags = merge(local.tags, { Name = "n8n-postgres-data-ap" })
 }
 
-# Deny non-TLS connections
+# Enforce TLS and allow access from the EC2 role
 resource "aws_efs_file_system_policy" "n8n" {
   file_system_id = aws_efs_file_system.n8n.id
 
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
+      {
+        Sid       = "AllowTLSAccess"
+        Effect    = "Allow"
+        Principal = { AWS = "*" }
+        Action = [
+          "elasticfilesystem:ClientMount",
+          "elasticfilesystem:ClientWrite",
+          "elasticfilesystem:ClientRootAccess"
+        ]
+        Condition = {
+          Bool = {
+            "aws:SecureTransport" = "true"
+          }
+        }
+      },
       {
         Sid       = "DenyNonTLS"
         Effect    = "Deny"

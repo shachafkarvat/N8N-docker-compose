@@ -5,6 +5,10 @@ resource "aws_acm_certificate" "n8n" {
   domain_name       = local.fqdn
   validation_method = "DNS"
 
+  options {
+    export = var.enable_alb ? "DISABLED" : "ENABLED"
+  }
+
   lifecycle {
     create_before_destroy = true
   }
