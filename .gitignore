@@ -104,3 +104,5 @@ backup_*.sql
 
 creds.json
 Production-plan/n8n-terraform-ec2-fixes
+CLAUDE.md
+Production-plan/archive
